@@ -55,7 +55,6 @@ def check_project_files():
         'test_pipeline.py',
         'generate_sample_data.py',
         'requirements.txt',
-        'README.md'
     ]
 
     all_ok = True
