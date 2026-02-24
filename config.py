@@ -50,9 +50,10 @@ class TrainingConfig:
 
     # Training schedule
     num_epochs: int = 20
-    train_batch_size: int = 4
-    eval_batch_size: int = 8
-    gradient_accumulation_steps: int = 4
+    train_batch_size: int = 1
+    eval_batch_size: int = 2
+    gradient_accumulation_steps: int = 8
+    fp16: bool = True  # Enable mixed precision
     warmup_ratio: float = 0.1
 
     # Early stopping

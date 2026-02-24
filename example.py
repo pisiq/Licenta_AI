@@ -22,7 +22,6 @@ from model import MultiTaskOrdinalClassifier
 from trainer import Trainer, create_optimizer_and_scheduler, compute_class_weights, set_seed
 from inference import PaperReviewPredictor, load_model_for_inference
 from torch.utils.data import DataLoader
-from generate_sample_data import generate_sample_dataset
 
 
 def collate_fn(batch):
@@ -49,14 +48,7 @@ def main():
     print("MULTI-TASK ORDINAL CLASSIFICATION PIPELINE - EXAMPLE")
     print("="*80 + "\n")
 
-    # ========== STEP 1: Generate Sample Data ==========
-    print("STEP 1: Generating sample data...")
-    data_path = "./data/papers_reviews.json"
 
-    if not os.path.exists(data_path):
-        generate_sample_dataset(num_papers=100, output_path=data_path)
-    else:
-        print(f"Data already exists at {data_path}")
 
     # ========== STEP 2: Setup Configuration ==========
     print("\nSTEP 2: Setting up configuration...")
@@ -74,7 +66,7 @@ def main():
     training_config.log_dir = "./demo_logs"
 
     data_config = DataConfig()
-    data_config.data_path = data_path
+    # data_config.data_path defaults to "./data/papers_reviews.json"
 
     set_seed(training_config.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
