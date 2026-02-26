@@ -29,36 +29,64 @@ def quadratic_weighted_kappa(y_true: np.ndarray, y_pred: np.ndarray, num_classes
 def compute_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    dimension_name: str = ""
+    dimension_name: str = "",
+    is_regression: bool = True
 ) -> Dict[str, float]:
     """
     Compute comprehensive metrics for a single dimension.
 
     Args:
-        y_true: True labels
-        y_pred: Predicted labels
+        y_true: True labels (continuous or discrete)
+        y_pred: Predicted values (continuous for regression, discrete for classification)
         dimension_name: Name of the dimension (for logging)
+        is_regression: If True, predictions are continuous and will be rounded for discrete metrics
 
     Returns:
         Dictionary of metrics
     """
     metrics = {}
 
-    # Accuracy
-    metrics['accuracy'] = accuracy_score(y_true, y_pred)
+    if is_regression:
+        # Round predictions to nearest integer for discrete metrics
+        y_pred_rounded = np.round(y_pred).astype(int)
+        # Clip to valid range [1, 5] (or [0, 4] depending on label format)
+        min_val = int(np.min(y_true))
+        max_val = int(np.max(y_true))
+        y_pred_rounded = np.clip(y_pred_rounded, min_val, max_val)
 
-    # Macro F1
-    metrics['macro_f1'] = f1_score(y_true, y_pred, average='macro')
+        # Discrete metrics use rounded predictions
+        metrics['accuracy'] = accuracy_score(y_true, y_pred_rounded)
+        metrics['macro_f1'] = f1_score(y_true, y_pred_rounded, average='macro', zero_division=0)
 
-    # Quadratic Weighted Kappa (primary metric)
-    metrics['qwk'] = quadratic_weighted_kappa(y_true, y_pred)
+        # QWK with rounded predictions
+        try:
+            metrics['qwk'] = quadratic_weighted_kappa(y_true, y_pred_rounded)
+        except:
+            metrics['qwk'] = 0.0
 
-    # Spearman correlation
-    spearman_corr, _ = spearmanr(y_true, y_pred)
-    metrics['spearman'] = spearman_corr if not np.isnan(spearman_corr) else 0.0
+        # Spearman correlation uses raw continuous predictions
+        spearman_corr, _ = spearmanr(y_true, y_pred)
+        metrics['spearman'] = spearman_corr if not np.isnan(spearman_corr) else 0.0
 
-    # Mean Absolute Error (for ordinal data)
-    metrics['mae'] = np.mean(np.abs(y_true - y_pred))
+        # MAE with raw predictions
+        metrics['mae'] = np.mean(np.abs(y_true - y_pred))
+
+        # MSE and RMSE for regression
+        metrics['mse'] = np.mean((y_true - y_pred) ** 2)
+        metrics['rmse'] = np.sqrt(metrics['mse'])
+    else:
+        # Classification mode - predictions already discrete
+        metrics['accuracy'] = accuracy_score(y_true, y_pred)
+        metrics['macro_f1'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
+
+        try:
+            metrics['qwk'] = quadratic_weighted_kappa(y_true, y_pred)
+        except:
+            metrics['qwk'] = 0.0
+
+        spearman_corr, _ = spearmanr(y_true, y_pred)
+        metrics['spearman'] = spearman_corr if not np.isnan(spearman_corr) else 0.0
+        metrics['mae'] = np.mean(np.abs(y_true - y_pred))
 
     return metrics
 
@@ -66,15 +94,17 @@ def compute_metrics(
 def compute_multi_task_metrics(
     predictions: Dict[str, np.ndarray],
     labels: Dict[str, np.ndarray],
-    score_dimensions: List[str]
+    score_dimensions: List[str],
+    is_regression: bool = True
 ) -> Dict[str, any]:
     """
     Compute metrics for all score dimensions.
 
     Args:
-        predictions: Dict of {dimension: predicted labels}
+        predictions: Dict of {dimension: predicted values}
         labels: Dict of {dimension: true labels}
         score_dimensions: List of score dimension names
+        is_regression: Whether predictions are continuous (regression) or discrete (classification)
 
     Returns:
         Dictionary containing:
@@ -95,13 +125,13 @@ def compute_multi_task_metrics(
             y_true = labels[dim]
             y_pred = predictions[dim]
 
-            # Filter out missing labels (-1)
-            valid_mask = y_true >= 0
+            # Filter out missing labels (-1 or NaN)
+            valid_mask = (y_true >= 0) & (~np.isnan(y_true))
             if valid_mask.sum() > 0:
                 y_true_valid = y_true[valid_mask]
                 y_pred_valid = y_pred[valid_mask]
 
-                dim_metrics = compute_metrics(y_true_valid, y_pred_valid, dim)
+                dim_metrics = compute_metrics(y_true_valid, y_pred_valid, dim, is_regression=is_regression)
                 results['per_dimension'][dim] = dim_metrics
 
                 # Collect for averaging

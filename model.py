@@ -7,8 +7,32 @@ from transformers import AutoModel, AutoConfig
 from typing import Dict, Optional, List
 
 
+class RegressionHead(nn.Module):
+    """Regression head for a single score dimension - outputs continuous score in [1, 5]."""
+
+    def __init__(self, hidden_size: int, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.regressor = nn.Linear(hidden_size, 1)
+        # Sigmoid + scaling to map output to [1, 5] range
+
+    def forward(self, pooled_output: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pooled_output: [batch_size, hidden_size]
+        Returns:
+            scores: [batch_size, 1] - continuous scores in range [1, 5]
+        """
+        x = self.dropout(pooled_output)
+        # Raw output
+        raw_score = self.regressor(x)
+        # Map to [1, 5] using sigmoid: 1 + 4 * sigmoid(x)
+        score = 1.0 + 4.0 * torch.sigmoid(raw_score)
+        return score.squeeze(-1)  # [batch_size]
+
+
 class ClassificationHead(nn.Module):
-    """Classification head for a single score dimension."""
+    """Classification head for a single score dimension (kept for backward compatibility)."""
 
     def __init__(self, hidden_size: int, num_classes: int = 5, dropout: float = 0.1):
         super().__init__()
@@ -29,23 +53,25 @@ class ClassificationHead(nn.Module):
 
 class MultiTaskOrdinalClassifier(nn.Module):
     """
-    Multi-task ordinal classification model.
+    Multi-task ordinal regression model.
 
-    Uses a shared transformer encoder with separate classification heads
-    for each score dimension.
+    Uses a shared transformer encoder with separate regression heads
+    for each score dimension. Outputs continuous scores in [1, 5] range.
     """
 
     def __init__(
         self,
         base_model_name: str,
         score_dimensions: List[str],
-        num_classes: int = 5,
-        dropout: float = 0.1
+        num_classes: int = 5,  # Kept for compatibility, not used in regression
+        dropout: float = 0.1,
+        use_regression: bool = True
     ):
         super().__init__()
 
         self.score_dimensions = score_dimensions
         self.num_classes = num_classes
+        self.use_regression = use_regression
 
         # Load pre-trained transformer
         self.config = AutoConfig.from_pretrained(base_model_name)
@@ -53,11 +79,18 @@ class MultiTaskOrdinalClassifier(nn.Module):
 
         hidden_size = self.config.hidden_size
 
-        # Create classification heads for each dimension
-        self.heads = nn.ModuleDict({
-            dim: ClassificationHead(hidden_size, num_classes, dropout)
-            for dim in score_dimensions
-        })
+        # Create regression heads for each dimension
+        if use_regression:
+            self.heads = nn.ModuleDict({
+                dim: RegressionHead(hidden_size, dropout)
+                for dim in score_dimensions
+            })
+        else:
+            # Keep classification for backward compatibility
+            self.heads = nn.ModuleDict({
+                dim: ClassificationHead(hidden_size, num_classes, dropout)
+                for dim in score_dimensions
+            })
 
     def forward(
         self,
@@ -72,12 +105,13 @@ class MultiTaskOrdinalClassifier(nn.Module):
         Args:
             input_ids: [batch_size, seq_len]
             attention_mask: [batch_size, seq_len]
-            labels: Dict of {dimension: [batch_size]} with values 0-4
-            class_weights: Optional dict of {dimension: [num_classes]} weight tensors
+            labels: Dict of {dimension: [batch_size]} with continuous values [1, 5] or -1 for missing
+            class_weights: Optional dict (not used in regression mode)
 
         Returns:
             Dictionary containing:
-                - logits: Dict of {dimension: [batch_size, num_classes]}
+                - predictions: Dict of {dimension: [batch_size]} continuous scores
+                - logits: Same as predictions (for backward compatibility)
                 - loss: Scalar tensor (if labels provided)
                 - per_task_loss: Dict of {dimension: scalar} (if labels provided)
         """
@@ -96,12 +130,15 @@ class MultiTaskOrdinalClassifier(nn.Module):
             hidden_states = outputs.last_hidden_state
             pooled_output = (hidden_states * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(1, keepdim=True)
 
-        # Compute logits for each dimension
-        logits = {}
+        # Compute predictions for each dimension
+        predictions = {}
         for dim in self.score_dimensions:
-            logits[dim] = self.heads[dim](pooled_output)
+            predictions[dim] = self.heads[dim](pooled_output)
 
-        output = {'logits': logits}
+        output = {
+            'predictions': predictions,
+            'logits': predictions  # For backward compatibility
+        }
 
         # Compute loss if labels provided
         if labels is not None:
@@ -110,23 +147,30 @@ class MultiTaskOrdinalClassifier(nn.Module):
 
             for dim in self.score_dimensions:
                 if dim in labels:
-                    dim_labels = labels[dim]
+                    dim_labels = labels[dim].float()  # Ensure float for regression
+                    dim_preds = predictions[dim]
 
-                    # Skip samples with missing labels (-1)
-                    valid_mask = dim_labels >= 0
+                    # Skip samples with missing labels (-1 or NaN)
+                    valid_mask = (dim_labels >= 0) & (~torch.isnan(dim_labels))
 
                     if valid_mask.sum() > 0:
-                        # Get weights for this dimension
-                        weight = class_weights.get(dim) if class_weights else None
-                        if weight is not None:
-                            weight = weight.to(logits[dim].device)
+                        if self.use_regression:
+                            # MSE Loss for regression
+                            loss_fn = nn.MSELoss(reduction='none')
+                            dim_loss = loss_fn(dim_preds, dim_labels)
 
-                        # Compute cross-entropy loss
-                        loss_fn = nn.CrossEntropyLoss(weight=weight, reduction='none')
-                        dim_loss = loss_fn(logits[dim], dim_labels)
+                            # Average over valid samples only
+                            dim_loss = (dim_loss * valid_mask.float()).sum() / valid_mask.sum()
+                        else:
+                            # Classification mode (backward compatibility)
+                            dim_labels_int = dim_labels.long()
+                            weight = class_weights.get(dim) if class_weights else None
+                            if weight is not None:
+                                weight = weight.to(dim_preds.device)
 
-                        # Average over valid samples
-                        dim_loss = (dim_loss * valid_mask.float()).sum() / valid_mask.sum()
+                            loss_fn = nn.CrossEntropyLoss(weight=weight, reduction='none')
+                            dim_loss = loss_fn(dim_preds, dim_labels_int)
+                            dim_loss = (dim_loss * valid_mask.float()).sum() / valid_mask.sum()
 
                         losses[dim] = dim_loss
                         valid_losses.append(dim_loss)
@@ -139,7 +183,7 @@ class MultiTaskOrdinalClassifier(nn.Module):
 
         return output
 
-    def predict_scores(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Dict[str, int]:
+    def predict_scores(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Dict[str, float]:
         """
         Predict scores for a single paper.
 
@@ -148,7 +192,7 @@ class MultiTaskOrdinalClassifier(nn.Module):
             attention_mask: [seq_len] or [1, seq_len]
 
         Returns:
-            Dictionary of {dimension: predicted_score} (1-5)
+            Dictionary of {dimension: predicted_score} (continuous value in [1, 5])
         """
         self.eval()
 
@@ -159,15 +203,19 @@ class MultiTaskOrdinalClassifier(nn.Module):
                 attention_mask = attention_mask.unsqueeze(0)
 
             outputs = self.forward(input_ids, attention_mask)
-            logits = outputs['logits']
+            predictions = outputs['predictions']
 
-            predictions = {}
-            for dim, dim_logits in logits.items():
-                # Get predicted class (0-4) and convert to score (1-5)
-                pred_class = torch.argmax(dim_logits, dim=-1).item()
-                predictions[dim] = pred_class + 1
+            scores = {}
+            for dim, pred in predictions.items():
+                if self.use_regression:
+                    # Return continuous score
+                    scores[dim] = pred.item()
+                else:
+                    # Classification mode - return class + 1
+                    pred_class = torch.argmax(pred, dim=-1).item()
+                    scores[dim] = pred_class + 1
 
-        return predictions
+        return scores
 
     def predict_probabilities(
         self,

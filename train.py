@@ -176,11 +176,13 @@ def main(args):
 
     # Create model
     print(f"\nInitializing model: {model_config.base_model_name}")
+    print(f"Mode: {'Regression' if model_config.use_regression else 'Classification'}")
     model = MultiTaskOrdinalClassifier(
         base_model_name=model_config.base_model_name,
         score_dimensions=model_config.score_dimensions,
         num_classes=model_config.num_classes,
-        dropout=model_config.hidden_dropout_prob
+        dropout=model_config.hidden_dropout_prob,
+        use_regression=model_config.use_regression
     )
 
     model.to(device)
@@ -219,7 +221,7 @@ def main(args):
     test_metrics = trainer.evaluate(test_dataloader)
     print(trainer.metrics_tracker.format_metrics(test_metrics, "Test Set Metrics"))
 
-    # Compute confusion matrices
+    # Compute confusion matrices (for rounded predictions in regression mode)
     print("\nComputing confusion matrices...")
 
     # Get predictions for test set
@@ -234,10 +236,15 @@ def main(args):
             labels = batch['labels']
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs['logits']
+            predictions = outputs['predictions']
 
             for dim in model_config.score_dimensions:
-                preds = torch.argmax(logits[dim], dim=-1).cpu().numpy()
+                if model_config.use_regression:
+                    # Continuous predictions - round for confusion matrix
+                    preds = predictions[dim].cpu().numpy()
+                else:
+                    # Classification predictions
+                    preds = torch.argmax(predictions[dim], dim=-1).cpu().numpy()
                 all_predictions[dim].extend(preds)
                 all_labels[dim].extend(labels[dim].numpy())
 
@@ -245,8 +252,24 @@ def main(args):
     all_predictions = {dim: np.array(preds) for dim, preds in all_predictions.items()}
     all_labels = {dim: np.array(labs) for dim, labs in all_labels.items()}
 
+    # Round predictions for confusion matrix if using regression
+    if model_config.use_regression:
+        all_predictions_rounded = {}
+        for dim in model_config.score_dimensions:
+            # Round and clip to valid range
+            preds_rounded = np.round(all_predictions[dim]).astype(int)
+            # Determine range from labels
+            valid_mask = all_labels[dim] >= 0
+            if valid_mask.sum() > 0:
+                min_val = int(np.min(all_labels[dim][valid_mask]))
+                max_val = int(np.max(all_labels[dim][valid_mask]))
+                preds_rounded = np.clip(preds_rounded, min_val, max_val)
+            all_predictions_rounded[dim] = preds_rounded
+    else:
+        all_predictions_rounded = all_predictions
+
     confusion_matrices = compute_confusion_matrices(
-        all_predictions,
+        all_predictions_rounded,
         all_labels,
         model_config.score_dimensions,
         model_config.num_classes

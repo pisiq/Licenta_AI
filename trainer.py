@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 
 from metrics import compute_multi_task_metrics, compute_confusion_matrices, MetricsTracker
 from model import MultiTaskOrdinalClassifier
@@ -66,7 +67,7 @@ def compute_class_weights(
 
 
 class Trainer:
-    """Trainer for multi-task ordinal classification."""
+    """Trainer for multi-task ordinal classification/regression."""
 
     def __init__(
         self,
@@ -90,6 +91,13 @@ class Trainer:
         self.class_weights = class_weights
         self.logger = logger
 
+        # AMP (Automatic Mixed Precision) for memory optimization
+        self.use_amp = config.fp16 and torch.cuda.is_available()
+        self.scaler = GradScaler() if self.use_amp else None
+
+        if self.use_amp:
+            print("✓ Using Automatic Mixed Precision (AMP) for faster training")
+
         # Move class weights to device
         if self.class_weights:
             self.class_weights = {
@@ -104,9 +112,34 @@ class Trainer:
         self.patience_counter = 0
         self.best_model_state = None
 
+        # Backbone freezing
+        self.freeze_epochs = getattr(config, 'freeze_backbone_epochs', 0)
+        if self.freeze_epochs > 0:
+            print(f"✓ Will freeze backbone for first {self.freeze_epochs} epochs")
+
+    def freeze_backbone(self):
+        """Freeze the encoder backbone."""
+        for param in self.model.encoder.parameters():
+            param.requires_grad = False
+        print("🔒 Backbone frozen")
+
+    def unfreeze_backbone(self):
+        """Unfreeze the encoder backbone."""
+        for param in self.model.encoder.parameters():
+            param.requires_grad = True
+        print("🔓 Backbone unfrozen")
+
     def train_epoch(self, epoch: int) -> float:
         """Train for one epoch."""
         self.model.train()
+
+        # Handle backbone freezing
+        if self.freeze_epochs > 0:
+            if epoch < self.freeze_epochs:
+                self.freeze_backbone()
+            elif epoch == self.freeze_epochs:
+                self.unfreeze_backbone()
+
         total_loss = 0.0
         num_batches = 0
 
@@ -121,31 +154,62 @@ class Trainer:
                 for dim in self.model.score_dimensions
             }
 
-            # Forward pass
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                class_weights=self.class_weights
-            )
+            # Forward pass with AMP
+            if self.use_amp:
+                with autocast():
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        class_weights=self.class_weights
+                    )
+                    loss = outputs['loss']
 
-            loss = outputs['loss']
+                # Backward pass with gradient scaling
+                self.scaler.scale(loss).backward()
 
-            # Backward pass
-            loss.backward()
+                # Gradient accumulation
+                if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                    # Gradient clipping (unscale first)
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm
+                    )
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.max_grad_norm
-            )
+                    # Optimizer step
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
 
-            # Optimizer step
-            if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                self.optimizer.step()
-                if self.scheduler:
-                    self.scheduler.step()
-                self.optimizer.zero_grad()
+                    if self.scheduler:
+                        self.scheduler.step()
+                    self.optimizer.zero_grad()
+            else:
+                # Regular training without AMP
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    class_weights=self.class_weights
+                )
+                loss = outputs['loss']
+
+                # Backward pass
+                loss.backward()
+
+                # Gradient accumulation
+                if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm
+                    )
+
+                    # Optimizer step
+                    self.optimizer.step()
+                    if self.scheduler:
+                        self.scheduler.step()
+                    self.optimizer.zero_grad()
 
             # Track loss
             total_loss += loss.item()
@@ -178,18 +242,29 @@ class Trainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels']
 
-                # Forward pass
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask
-                )
+                # Forward pass (with AMP if enabled)
+                if self.use_amp:
+                    with autocast():
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask
+                        )
+                else:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask
+                    )
 
-                logits = outputs['logits']
+                predictions = outputs['predictions']
 
                 # Collect predictions and labels
                 for dim in self.model.score_dimensions:
-                    # Get predictions
-                    preds = torch.argmax(logits[dim], dim=-1).cpu().numpy()
+                    # Get predictions (continuous scores for regression)
+                    if self.model.use_regression:
+                        preds = predictions[dim].cpu().numpy()
+                    else:
+                        # Classification mode - get argmax
+                        preds = torch.argmax(predictions[dim], dim=-1).cpu().numpy()
                     all_predictions[dim].extend(preds)
 
                     # Get labels
@@ -204,7 +279,8 @@ class Trainer:
         metrics = compute_multi_task_metrics(
             all_predictions,
             all_labels,
-            self.model.score_dimensions
+            self.model.score_dimensions,
+            is_regression=self.model.use_regression
         )
 
         return metrics
@@ -321,13 +397,21 @@ def create_optimizer_and_scheduler(
 
     # Learning rate scheduler
     num_training_steps = len(train_dataloader) * config.num_epochs // config.gradient_accumulation_steps
-    num_warmup_steps = int(num_training_steps * config.warmup_ratio)
+
+    # Use warmup_steps if provided, otherwise use warmup_ratio
+    if hasattr(config, 'warmup_steps') and config.warmup_steps is not None:
+        num_warmup_steps = config.warmup_steps
+    else:
+        num_warmup_steps = int(num_training_steps * config.warmup_ratio)
 
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=num_warmup_steps,
         num_training_steps=num_training_steps
     )
+
+    print(f"✓ Optimizer: AdamW (lr={config.learning_rate}, weight_decay={config.weight_decay})")
+    print(f"✓ Scheduler: Linear warmup ({num_warmup_steps} steps) + decay ({num_training_steps} total steps)")
 
     return optimizer, scheduler
 
