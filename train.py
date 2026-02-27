@@ -14,28 +14,38 @@ from data_preprocessing import (
     ReviewAggregator,
     PaperReviewDataset,
     load_and_preprocess_data,
+    load_all_peerread_data,
     split_data
 )
 from model import MultiTaskOrdinalClassifier
 from trainer import Trainer, create_optimizer_and_scheduler, compute_class_weights, set_seed
-from metrics import compute_multi_task_metrics, compute_confusion_matrices
+from metrics import compute_confusion_matrices
 
 
 def collate_fn(batch):
     """Custom collate function for DataLoader."""
-    input_ids = torch.stack([item['input_ids'] for item in batch])
+    input_ids      = torch.stack([item['input_ids']      for item in batch])
     attention_mask = torch.stack([item['attention_mask'] for item in batch])
 
-    # Collect labels for each dimension
-    labels = {}
-    score_dimensions = batch[0]['labels'].keys()
-    for dim in score_dimensions:
-        labels[dim] = torch.tensor([item['labels'][dim] for item in batch])
+    score_dimensions = list(batch[0]['labels'].keys())
+
+    # Labels: stack pre-built float tensors (NaN where score is missing)
+    labels = {
+        dim: torch.stack([item['labels'][dim] for item in batch])
+        for dim in score_dimensions
+    }
+
+    # Mask: stack pre-built float tensors (1.0 valid, 0.0 missing)
+    label_mask = {
+        dim: torch.stack([item['label_mask'][dim] for item in batch])
+        for dim in score_dimensions
+    }
 
     return {
-        'input_ids': input_ids,
+        'input_ids':      input_ids,
         'attention_mask': attention_mask,
-        'labels': labels
+        'labels':         labels,
+        'label_mask':     label_mask,
     }
 
 
@@ -93,14 +103,23 @@ def main(args):
         max_val=data_config.max_label
     )
 
-    # Load and preprocess data
-    all_data = load_and_preprocess_data(
-        data_config.data_path,
-        text_preprocessor,
-        review_aggregator
-    )
-
-    print(f"Loaded {len(all_data)} papers with reviews")
+    # Load data - use combined dataset from all conferences if use_all_data is True
+    if args.use_all_data:
+        print("\n[*] Loading ALL PeerRead data from multiple conferences...")
+        all_data = load_all_peerread_data(
+            base_data_path='./data',
+            text_preprocessor=text_preprocessor,
+            review_aggregator=review_aggregator
+        )
+    else:
+        print("\n[*] Loading data from single JSON file...")
+        # Load and preprocess data from single file
+        all_data = load_and_preprocess_data(
+            data_config.data_path,
+            text_preprocessor,
+            review_aggregator
+        )
+        print(f"Loaded {len(all_data)} papers with reviews")
 
     # Split data
     train_data, dev_data, test_data = split_data(
@@ -111,32 +130,41 @@ def main(args):
         seed=training_config.seed
     )
 
-    print(f"Train: {len(train_data)}, Dev: {len(dev_data)}, Test: {len(test_data)}")
+    print(f"\n[*] Data split:")
+    print(f"  Train: {len(train_data)} papers")
+    print(f"  Dev: {len(dev_data)} papers")
+    print(f"  Test: {len(test_data)} papers")
 
     # Load tokenizer
     print(f"\nLoading tokenizer: {model_config.base_model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_config.base_model_name)
 
     # Create datasets
+    # train : paper + review  -> model learns what paper content earns what score
+    # dev   : paper only      -> evaluation mirrors real-world inference
+    # test  : paper only      -> final test mirrors real-world inference
     train_dataset = PaperReviewDataset(
         train_data,
         tokenizer,
         max_length=model_config.max_length,
-        score_dimensions=model_config.score_dimensions
+        score_dimensions=model_config.score_dimensions,
+        inference_mode=False   # training: paper + review
     )
 
     dev_dataset = PaperReviewDataset(
         dev_data,
         tokenizer,
         max_length=model_config.max_length,
-        score_dimensions=model_config.score_dimensions
+        score_dimensions=model_config.score_dimensions,
+        inference_mode=True    # eval: paper only (no review leakage)
     )
 
     test_dataset = PaperReviewDataset(
         test_data,
         tokenizer,
         max_length=model_config.max_length,
-        score_dimensions=model_config.score_dimensions
+        score_dimensions=model_config.score_dimensions,
+        inference_mode=True    # test: paper only (no review leakage)
     )
 
     # Compute class weights if enabled
@@ -250,27 +278,32 @@ def main(args):
 
     import numpy as np
     all_predictions = {dim: np.array(preds) for dim, preds in all_predictions.items()}
-    all_labels = {dim: np.array(labs) for dim, labs in all_labels.items()}
+    all_labels      = {dim: np.array(labs)  for dim, labs  in all_labels.items()}
 
-    # Round predictions for confusion matrix if using regression
+    # Filter NaN labels and round both labels and preds to int for confusion matrix
     if model_config.use_regression:
         all_predictions_rounded = {}
+        all_labels_rounded = {}
         for dim in model_config.score_dimensions:
-            # Round and clip to valid range
-            preds_rounded = np.round(all_predictions[dim]).astype(int)
-            # Determine range from labels
-            valid_mask = all_labels[dim] >= 0
+            lab = all_labels[dim]
+            pred = all_predictions[dim]
+            valid_mask = (~np.isnan(lab)) & (lab >= 1)
             if valid_mask.sum() > 0:
-                min_val = int(np.min(all_labels[dim][valid_mask]))
-                max_val = int(np.max(all_labels[dim][valid_mask]))
-                preds_rounded = np.clip(preds_rounded, min_val, max_val)
-            all_predictions_rounded[dim] = preds_rounded
+                lab_int  = np.clip(np.round(lab[valid_mask]).astype(int),  1, 5)
+                pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, 5)
+            else:
+                lab_int, pred_int = np.array([], dtype=int), np.array([], dtype=int)
+            all_labels_rounded[dim]      = lab_int
+            all_predictions_rounded[dim] = pred_int
     else:
-        all_predictions_rounded = all_predictions
+        all_predictions_rounded = {dim: np.round(all_predictions[dim]).astype(int)
+                                   for dim in model_config.score_dimensions}
+        all_labels_rounded      = {dim: np.round(all_labels[dim]).astype(int)
+                                   for dim in model_config.score_dimensions}
 
     confusion_matrices = compute_confusion_matrices(
         all_predictions_rounded,
-        all_labels,
+        all_labels_rounded,
         model_config.score_dimensions,
         model_config.num_classes
     )
@@ -293,7 +326,7 @@ def main(args):
 
     results_path = os.path.join(training_config.output_dir, 'test_results.pt')
     torch.save(results, results_path)
-    print(f"\n✓ Test results saved to {results_path}")
+    print(f"\n[OK] Test results saved to {results_path}")
 
     # Close logger
     logger.close()
@@ -307,6 +340,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train multi-task ordinal classifier for paper review scoring")
 
     parser.add_argument("--data_path", type=str, default=None, help="Path to training data JSON")
+    parser.add_argument("--use_all_data", action="store_true", help="Load ALL PeerRead data from all conference folders")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for models")
     parser.add_argument("--base_model", type=str, default=None, help="Base transformer model")
     parser.add_argument("--batch_size", type=int, default=None, help="Training batch size")

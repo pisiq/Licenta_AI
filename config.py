@@ -45,6 +45,8 @@ class TrainingConfig:
     """Training hyperparameters."""
     # Optimization
     learning_rate: float = 2e-5
+    backbone_lr: float = 5e-6  # Lower LR for pretrained backbone when unfrozen
+    head_lr: float = 5e-5  # Higher LR for regression heads
     weight_decay: float = 0.01
     adam_epsilon: float = 1e-8
     max_grad_norm: float = 1.0
@@ -59,14 +61,14 @@ class TrainingConfig:
     fp16: bool = True  # Enable AMP (Automatic Mixed Precision)
 
     # Learning rate schedule
-    warmup_ratio: float = 0.1  # Used if warmup_steps is None
-    warmup_steps: int = 100  # Explicit warmup steps (overrides warmup_ratio)
+    warmup_ratio: float = 0.2  # 20% warmup for larger combined dataset
+    warmup_steps: int = None  # Will be calculated from warmup_ratio if None
 
     # Backbone freezing
     freeze_backbone_epochs: int = 2  # Freeze encoder for first N epochs
 
     # Early stopping
-    early_stopping_patience: int = 3
+    early_stopping_patience: int = 7  # Increased patience for better convergence
     early_stopping_metric: str = "avg_qwk"  # Average QWK across all dimensions
 
     # Class weights (only used in classification mode)

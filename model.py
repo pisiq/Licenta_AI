@@ -155,8 +155,8 @@ class MultiTaskOrdinalClassifier(nn.Module):
 
                     if valid_mask.sum() > 0:
                         if self.use_regression:
-                            # MSE Loss for regression
-                            loss_fn = nn.MSELoss(reduction='none')
+                            # Huber Loss for regression (more robust to outliers than MSE)
+                            loss_fn = nn.HuberLoss(reduction='none', delta=1.0)
                             dim_loss = loss_fn(dim_preds, dim_labels)
 
                             # Average over valid samples only

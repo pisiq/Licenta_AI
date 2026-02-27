@@ -9,9 +9,9 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
-from metrics import compute_multi_task_metrics, compute_confusion_matrices, MetricsTracker
+from metrics import compute_multi_task_metrics, MetricsTracker
 from model import MultiTaskOrdinalClassifier
 
 
@@ -93,10 +93,10 @@ class Trainer:
 
         # AMP (Automatic Mixed Precision) for memory optimization
         self.use_amp = config.fp16 and torch.cuda.is_available()
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = GradScaler(device="cuda") if self.use_amp else None
 
         if self.use_amp:
-            print("✓ Using Automatic Mixed Precision (AMP) for faster training")
+            print("[OK] Using Automatic Mixed Precision (AMP) for faster training")
 
         # Move class weights to device
         if self.class_weights:
@@ -107,27 +107,27 @@ class Trainer:
         # Metrics tracker
         self.metrics_tracker = MetricsTracker(model.score_dimensions)
 
-        # Early stopping
-        self.best_avg_qwk = 0.0
+        # Early stopping — use composite score so we don't stall at QWK=0
+        self.best_score = float('-inf')
         self.patience_counter = 0
         self.best_model_state = None
 
         # Backbone freezing
         self.freeze_epochs = getattr(config, 'freeze_backbone_epochs', 0)
         if self.freeze_epochs > 0:
-            print(f"✓ Will freeze backbone for first {self.freeze_epochs} epochs")
+            print(f"[OK] Will freeze backbone for first {self.freeze_epochs} epochs")
 
     def freeze_backbone(self):
         """Freeze the encoder backbone."""
         for param in self.model.encoder.parameters():
             param.requires_grad = False
-        print("🔒 Backbone frozen")
+        print("[FROZEN] Backbone frozen")
 
     def unfreeze_backbone(self):
         """Unfreeze the encoder backbone."""
         for param in self.model.encoder.parameters():
             param.requires_grad = True
-        print("🔓 Backbone unfrozen")
+        print("[UNFROZEN] Backbone unfrozen")
 
     def train_epoch(self, epoch: int) -> float:
         """Train for one epoch."""
@@ -153,10 +153,15 @@ class Trainer:
                 dim: batch['labels'][dim].to(self.device)
                 for dim in self.model.score_dimensions
             }
+            # label_mask is optional (new dataset provides it, old collate may not)
+            label_mask = {
+                dim: batch['label_mask'][dim].to(self.device)
+                for dim in self.model.score_dimensions
+            } if 'label_mask' in batch else None
 
             # Forward pass with AMP
             if self.use_amp:
-                with autocast():
+                with autocast(device_type="cuda"):
                     outputs = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -244,7 +249,7 @@ class Trainer:
 
                 # Forward pass (with AMP if enabled)
                 if self.use_amp:
-                    with autocast():
+                    with autocast(device_type="cuda"):
                         outputs = self.model(
                             input_ids=input_ids,
                             attention_mask=attention_mask
@@ -257,19 +262,19 @@ class Trainer:
 
                 predictions = outputs['predictions']
 
-                # Collect predictions and labels
+                # Collect predictions and labels  (skip NaN / missing labels)
                 for dim in self.model.score_dimensions:
-                    # Get predictions (continuous scores for regression)
+                    dim_labels = labels[dim].numpy()  # may contain NaN
+
                     if self.model.use_regression:
                         preds = predictions[dim].cpu().numpy()
                     else:
-                        # Classification mode - get argmax
                         preds = torch.argmax(predictions[dim], dim=-1).cpu().numpy()
-                    all_predictions[dim].extend(preds)
 
-                    # Get labels
-                    dim_labels = labels[dim].numpy()
-                    all_labels[dim].extend(dim_labels)
+                    # Only keep samples with a valid (non-NaN, >= 1) label
+                    valid_mask = (~np.isnan(dim_labels)) & (dim_labels >= 1)
+                    all_predictions[dim].extend(preds[valid_mask])
+                    all_labels[dim].extend(dim_labels[valid_mask])
 
         # Convert to numpy arrays
         all_predictions = {dim: np.array(preds) for dim, preds in all_predictions.items()}
@@ -318,10 +323,22 @@ class Trainer:
                 for metric_name, value in dev_metrics['macro_avg'].items():
                     self.logger.add_scalar(f'dev/{metric_name}', value, epoch)
 
-            # Early stopping check
-            avg_qwk = dev_metrics['avg_qwk']
-            if avg_qwk > self.best_avg_qwk:
-                self.best_avg_qwk = avg_qwk
+            # ------------------------------------------------------------------
+            # Early stopping — composite score:
+            #   primary  : avg_qwk   (0 when collapsed, positive once learning)
+            #   secondary: avg_spearman (tracks rank order even before QWK improves)
+            #   tertiary : -avg_mae  (lower MAE = better, so negate it)
+            # Weighted sum so the model always makes "progress" signals visible.
+            # ------------------------------------------------------------------
+            avg_qwk      = dev_metrics.get('avg_qwk', 0.0)
+            avg_spearman = dev_metrics['macro_avg'].get('spearman', 0.0)
+            avg_mae      = dev_metrics['macro_avg'].get('mae', 5.0)
+            # Composite: QWK dominates once it improves, but MAE/Spearman give
+            # signal while QWK is still flat.
+            composite_score = (2.0 * avg_qwk) + (0.5 * avg_spearman) + (-0.3 * avg_mae)
+
+            if composite_score > self.best_score:
+                self.best_score = composite_score
                 self.patience_counter = 0
                 # Save best model
                 self.best_model_state = {
@@ -329,18 +346,22 @@ class Trainer:
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'avg_qwk': avg_qwk,
+                    'composite_score': composite_score,
                     'metrics': dev_metrics
                 }
-                print(f"\n🎉 New best model! Avg QWK: {avg_qwk:.4f}")
+                print(f"\n[BEST] New best model! QWK={avg_qwk:.4f}  "
+                      f"Spearman={avg_spearman:.4f}  MAE={avg_mae:.4f}  "
+                      f"Composite={composite_score:.4f}")
 
                 # Save checkpoint
                 self.save_checkpoint(epoch, is_best=True)
             else:
                 self.patience_counter += 1
-                print(f"\nNo improvement. Patience: {self.patience_counter}/{self.config.early_stopping_patience}")
+                print(f"\nNo improvement. Patience: {self.patience_counter}/{self.config.early_stopping_patience}"
+                      f"  (score={composite_score:.4f}, best={self.best_score:.4f})")
 
                 if self.patience_counter >= self.config.early_stopping_patience:
-                    print(f"\n⚠️ Early stopping triggered after {epoch + 1} epochs")
+                    print(f"\n[STOP] Early stopping triggered after {epoch + 1} epochs")
                     break
 
             # Save periodic checkpoint
@@ -350,13 +371,14 @@ class Trainer:
         print("\n" + "="*80)
         print("Training completed!")
         best_epoch, best_qwk = self.metrics_tracker.get_best_metrics()
-        print(f"Best model: Epoch {best_epoch + 1}, Avg QWK: {best_qwk:.4f}")
+        print(f"Best model: Epoch {best_epoch + 1}, Avg QWK: {best_qwk:.4f}  "
+              f"(composite score: {self.best_score:.4f})")
         print("="*80)
 
         # Load best model
         if self.best_model_state:
             self.model.load_state_dict(self.best_model_state['model_state_dict'])
-            print("\n✓ Best model loaded")
+            print("\n[OK] Best model loaded")
 
         return self.best_model_state
 
@@ -374,11 +396,11 @@ class Trainer:
         if is_best:
             path = os.path.join(self.config.output_dir, 'best_model.pt')
             torch.save(checkpoint, path)
-            print(f"✓ Best model saved to {path}")
+            print(f"[OK] Best model saved to {path}")
         else:
             path = os.path.join(self.config.output_dir, f'checkpoint_epoch_{epoch}.pt')
             torch.save(checkpoint, path)
-            print(f"✓ Checkpoint saved to {path}")
+            print(f"[OK] Checkpoint saved to {path}")
 
 
 def create_optimizer_and_scheduler(
@@ -386,13 +408,37 @@ def create_optimizer_and_scheduler(
     train_dataloader: DataLoader,
     config
 ):
-    """Create optimizer and learning rate scheduler."""
-    # Optimizer
+    """Create optimizer with differential learning rates and scheduler."""
+
+    # Separate parameters for backbone and heads
+    backbone_params = []
+    head_params = []
+
+    for name, param in model.named_parameters():
+        if 'encoder' in name:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    # Create parameter groups with differential learning rates
+    # During freezing, only heads will train. After unfreezing, use different LRs.
+    optimizer_grouped_parameters = [
+        {
+            'params': backbone_params,
+            'lr': config.backbone_lr,  # Lower LR for pretrained encoder
+            'weight_decay': config.weight_decay
+        },
+        {
+            'params': head_params,
+            'lr': config.head_lr,  # Higher LR for regression heads
+            'weight_decay': config.weight_decay
+        }
+    ]
+
+    # Optimizer with parameter groups
     optimizer = AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        eps=config.adam_epsilon,
-        weight_decay=config.weight_decay
+        optimizer_grouped_parameters,
+        eps=config.adam_epsilon
     )
 
     # Learning rate scheduler
@@ -410,8 +456,11 @@ def create_optimizer_and_scheduler(
         num_training_steps=num_training_steps
     )
 
-    print(f"✓ Optimizer: AdamW (lr={config.learning_rate}, weight_decay={config.weight_decay})")
-    print(f"✓ Scheduler: Linear warmup ({num_warmup_steps} steps) + decay ({num_training_steps} total steps)")
+    print(f"[OK] Optimizer: AdamW with differential LRs")
+    print(f"  - Backbone LR: {config.backbone_lr:.2e}")
+    print(f"  - Head LR: {config.head_lr:.2e}")
+    print(f"  - Weight decay: {config.weight_decay}")
+    print(f"[OK] Scheduler: Linear warmup ({num_warmup_steps} steps / {config.warmup_ratio*100:.0f}%) + decay ({num_training_steps} total steps)")
 
     return optimizer, scheduler
 

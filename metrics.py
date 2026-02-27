@@ -49,31 +49,32 @@ def compute_metrics(
     if is_regression:
         # Round predictions to nearest integer for discrete metrics
         y_pred_rounded = np.round(y_pred).astype(int)
-        # Clip to valid range [1, 5] (or [0, 4] depending on label format)
-        min_val = int(np.min(y_true))
-        max_val = int(np.max(y_true))
+        # Round and cast true labels too (they may be float averages like 3.67)
+        y_true_rounded = np.round(y_true).astype(int)
+        # Clip to valid range [1, 5]
+        min_val = int(np.min(y_true_rounded))
+        max_val = int(np.max(y_true_rounded))
         y_pred_rounded = np.clip(y_pred_rounded, min_val, max_val)
+        y_true_rounded = np.clip(y_true_rounded, 1, 5)
 
-        # Discrete metrics use rounded predictions
-        metrics['accuracy'] = accuracy_score(y_true, y_pred_rounded)
-        metrics['macro_f1'] = f1_score(y_true, y_pred_rounded, average='macro', zero_division=0)
+        # Discrete metrics use rounded integers
+        metrics['accuracy'] = accuracy_score(y_true_rounded, y_pred_rounded)
+        metrics['macro_f1'] = f1_score(y_true_rounded, y_pred_rounded, average='macro', zero_division=0)
 
         # QWK with rounded predictions
         try:
-            metrics['qwk'] = quadratic_weighted_kappa(y_true, y_pred_rounded)
-        except:
+            metrics['qwk'] = quadratic_weighted_kappa(y_true_rounded, y_pred_rounded)
+        except Exception:
             metrics['qwk'] = 0.0
 
-        # Spearman correlation uses raw continuous predictions
+        # Spearman correlation uses raw continuous predictions vs raw true floats
         spearman_corr, _ = spearmanr(y_true, y_pred)
         metrics['spearman'] = spearman_corr if not np.isnan(spearman_corr) else 0.0
 
-        # MAE with raw predictions
-        metrics['mae'] = np.mean(np.abs(y_true - y_pred))
-
-        # MSE and RMSE for regression
-        metrics['mse'] = np.mean((y_true - y_pred) ** 2)
-        metrics['rmse'] = np.sqrt(metrics['mse'])
+        # Regression error metrics
+        metrics['mae'] = float(np.mean(np.abs(y_true - y_pred)))
+        metrics['mse'] = float(np.mean((y_true - y_pred) ** 2))
+        metrics['rmse'] = float(np.sqrt(metrics['mse']))
     else:
         # Classification mode - predictions already discrete
         metrics['accuracy'] = accuracy_score(y_true, y_pred)
