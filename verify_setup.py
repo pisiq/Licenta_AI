@@ -51,7 +51,6 @@ def check_project_files():
         'trainer.py',
         'train.py',
         'inference.py',
-        'example.py',
         'test_pipeline.py',
         'generate_sample_data.py',
         'requirements.txt',

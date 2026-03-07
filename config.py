@@ -28,15 +28,17 @@ class ModelConfig:
 
     def __post_init__(self):
         if self.score_dimensions is None:
+            # RECOMMENDATION is PRIMARY (index 0).
+            # The rest are auxiliary — masked out for ICLR samples.
             self.score_dimensions = [
-                "IMPACT",
-                "SUBSTANCE",
-                "APPROPRIATENESS",
-                "MEANINGFUL_COMPARISON",
-                "SOUNDNESS_CORRECTNESS",
-                "ORIGINALITY",
-                "CLARITY",
-                "RECOMMENDATION"
+                "RECOMMENDATION",           # primary — all conferences
+                "IMPACT",                   # auxiliary — ACL/CoNLL only
+                "SUBSTANCE",                # auxiliary — ACL/CoNLL only
+                "APPROPRIATENESS",          # auxiliary — ACL/CoNLL only
+                "MEANINGFUL_COMPARISON",    # auxiliary — ACL/CoNLL only
+                "SOUNDNESS_CORRECTNESS",    # auxiliary — ACL/CoNLL only
+                "ORIGINALITY",              # auxiliary — ACL/CoNLL only
+                "CLARITY",                  # auxiliary — ACL/CoNLL only
             ]
 
 
@@ -69,7 +71,7 @@ class TrainingConfig:
 
     # Early stopping
     early_stopping_patience: int = 7  # Increased patience for better convergence
-    early_stopping_metric: str = "avg_qwk"  # Average QWK across all dimensions
+    early_stopping_metric: str = "avg_spearman"  # Average QWK across all dimensions
 
     # Class weights (only used in classification mode)
     use_class_weights: bool = False  # Disabled for regression

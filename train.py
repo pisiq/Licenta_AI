@@ -13,9 +13,11 @@ from data_preprocessing import (
     TextPreprocessor,
     ReviewAggregator,
     PaperReviewDataset,
+    load_peerread_data,
     load_and_preprocess_data,
-    load_all_peerread_data,
-    split_data
+    split_data,
+    SCORE_DIMENSIONS,
+    PEERREAD_ALL_CONFERENCES,
 )
 from model import MultiTaskOrdinalClassifier
 from trainer import Trainer, create_optimizer_and_scheduler, compute_class_weights, set_seed
@@ -103,17 +105,19 @@ def main(args):
         max_val=data_config.max_label
     )
 
-    # Load data - use combined dataset from all conferences if use_all_data is True
+    # Load data
     if args.use_all_data:
-        print("\n[*] Loading ALL PeerRead data from multiple conferences...")
-        all_data = load_all_peerread_data(
-            base_data_path='./data',
-            text_preprocessor=text_preprocessor,
-            review_aggregator=review_aggregator
+        print("\n[*] Loading ALL PeerRead data (ACL 2017, CoNLL 2016, ICLR 2017-2020)...")
+        all_data = load_peerread_data(
+            base_data_path    = './data',
+            text_preprocessor = text_preprocessor,
+            conference_folders = PEERREAD_ALL_CONFERENCES,
+            require_pdf       = True,
+            verbose           = True,
+            seed              = training_config.seed,
         )
     else:
         print("\n[*] Loading data from single JSON file...")
-        # Load and preprocess data from single file
         all_data = load_and_preprocess_data(
             data_config.data_path,
             text_preprocessor,
@@ -143,11 +147,12 @@ def main(args):
     # train : paper + review  -> model learns what paper content earns what score
     # dev   : paper only      -> evaluation mirrors real-world inference
     # test  : paper only      -> final test mirrors real-world inference
+    effective_dims = model_config.score_dimensions or SCORE_DIMENSIONS
     train_dataset = PaperReviewDataset(
         train_data,
         tokenizer,
         max_length=model_config.max_length,
-        score_dimensions=model_config.score_dimensions,
+        score_dimensions=effective_dims,
         inference_mode=False   # training: paper + review
     )
 
@@ -155,7 +160,7 @@ def main(args):
         dev_data,
         tokenizer,
         max_length=model_config.max_length,
-        score_dimensions=model_config.score_dimensions,
+        score_dimensions=effective_dims,
         inference_mode=True    # eval: paper only (no review leakage)
     )
 
@@ -163,7 +168,7 @@ def main(args):
         test_data,
         tokenizer,
         max_length=model_config.max_length,
-        score_dimensions=model_config.score_dimensions,
+        score_dimensions=effective_dims,
         inference_mode=True    # test: paper only (no review leakage)
     )
 

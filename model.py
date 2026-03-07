@@ -6,6 +6,19 @@ import torch.nn as nn
 from transformers import AutoModel, AutoConfig
 from typing import Dict, Optional, List
 
+# Per-dimension loss weights: RECOMMENDATION is primary (3x), others auxiliary
+# Imported lazily to avoid circular import; fallback defaults provided here.
+_DEFAULT_SCORE_WEIGHTS: Dict[str, float] = {
+    "RECOMMENDATION":        3.0,
+    "IMPACT":                0.5,
+    "SUBSTANCE":             0.5,
+    "APPROPRIATENESS":       0.5,
+    "MEANINGFUL_COMPARISON": 0.5,
+    "SOUNDNESS_CORRECTNESS": 0.5,
+    "ORIGINALITY":           0.5,
+    "CLARITY":               0.5,
+}
+
 
 class RegressionHead(nn.Module):
     """Regression head for a single score dimension - outputs continuous score in [1, 5]."""
@@ -143,42 +156,45 @@ class MultiTaskOrdinalClassifier(nn.Module):
         # Compute loss if labels provided
         if labels is not None:
             losses = {}
-            valid_losses = []
+            weighted_loss_sum = torch.tensor(0.0, device=pooled_output.device)
+            weight_total      = 0.0
 
             for dim in self.score_dimensions:
-                if dim in labels:
-                    dim_labels = labels[dim].float()  # Ensure float for regression
-                    dim_preds = predictions[dim]
+                if dim not in labels:
+                    continue
 
-                    # Skip samples with missing labels (-1 or NaN)
-                    valid_mask = (dim_labels >= 0) & (~torch.isnan(dim_labels))
+                dim_labels = labels[dim].float()
+                dim_preds  = predictions[dim]
 
-                    if valid_mask.sum() > 0:
-                        if self.use_regression:
-                            # Huber Loss for regression (more robust to outliers than MSE)
-                            loss_fn = nn.HuberLoss(reduction='none', delta=1.0)
-                            dim_loss = loss_fn(dim_preds, dim_labels)
+                # Per-dimension task weight (RECOMMENDATION=3.0, others=0.5)
+                dim_weight = _DEFAULT_SCORE_WEIGHTS.get(dim, 0.5)
 
-                            # Average over valid samples only
-                            dim_loss = (dim_loss * valid_mask.float()).sum() / valid_mask.sum()
-                        else:
-                            # Classification mode (backward compatibility)
-                            dim_labels_int = dim_labels.long()
-                            weight = class_weights.get(dim) if class_weights else None
-                            if weight is not None:
-                                weight = weight.to(dim_preds.device)
+                # Skip samples with missing labels (-1 or NaN)
+                valid_mask = (dim_labels >= 0) & (~torch.isnan(dim_labels))
 
-                            loss_fn = nn.CrossEntropyLoss(weight=weight, reduction='none')
-                            dim_loss = loss_fn(dim_preds, dim_labels_int)
-                            dim_loss = (dim_loss * valid_mask.float()).sum() / valid_mask.sum()
+                if valid_mask.sum() > 0:
+                    if self.use_regression:
+                        # Huber Loss — robust to score outliers
+                        loss_fn  = nn.HuberLoss(reduction='none', delta=1.0)
+                        dim_loss = loss_fn(dim_preds[valid_mask], dim_labels[valid_mask])
+                        dim_loss = dim_loss.mean()
+                    else:
+                        # Classification mode (backward compatibility)
+                        dim_labels_int = dim_labels.long()
+                        cls_weight = class_weights.get(dim) if class_weights else None
+                        if cls_weight is not None:
+                            cls_weight = cls_weight.to(dim_preds.device)
+                        loss_fn  = nn.CrossEntropyLoss(weight=cls_weight, reduction='none')
+                        dim_loss = loss_fn(dim_preds[valid_mask], dim_labels_int[valid_mask])
+                        dim_loss = dim_loss.mean()
 
-                        losses[dim] = dim_loss
-                        valid_losses.append(dim_loss)
+                    losses[dim]        = dim_loss
+                    weighted_loss_sum  = weighted_loss_sum + dim_weight * dim_loss
+                    weight_total      += dim_weight
 
-            # Average loss across all dimensions
-            if valid_losses:
-                total_loss = torch.stack(valid_losses).mean()
-                output['loss'] = total_loss
+            if weight_total > 0:
+                total_loss = weighted_loss_sum / weight_total
+                output['loss']          = total_loss
                 output['per_task_loss'] = losses
 
         return output
