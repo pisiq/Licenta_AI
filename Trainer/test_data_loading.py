@@ -27,7 +27,7 @@ def inspect_data_structure():
     print("="*80)
 
     for conf in conferences:
-        conf_path = os.path.join('./data', conf)
+        conf_path = os.path.join('../data', conf)
 
         if not os.path.exists(conf_path):
             print(f"\nX {conf}: Not found")
@@ -102,7 +102,7 @@ def test_loading():
 
     # Load all data
     all_data = load_all_peerread_data(
-        base_data_path='./data',
+        base_data_path='../data',
         text_preprocessor=text_preprocessor,
         review_aggregator=review_aggregator
     )

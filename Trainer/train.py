@@ -109,7 +109,7 @@ def main(args):
     if args.use_all_data:
         print("\n[*] Loading ALL PeerRead data (ACL 2017, CoNLL 2016, ICLR 2017-2020)...")
         all_data = load_peerread_data(
-            base_data_path    = './data',
+            base_data_path    ='../data',
             text_preprocessor = text_preprocessor,
             conference_folders = PEERREAD_ALL_CONFERENCES,
             require_pdf       = True,
@@ -186,25 +186,34 @@ def main(args):
             print(f"  {dim}: {weights.numpy()}")
 
     # Create data loaders
+    # num_workers=0 on Windows (avoids multiprocessing spawn issues)
+    # pin_memory=True speeds up CPU→GPU transfers on CUDA
+    _pin = device.type == 'cuda'
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=training_config.train_batch_size,
         shuffle=True,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=_pin,
     )
 
     dev_dataloader = DataLoader(
         dev_dataset,
         batch_size=training_config.eval_batch_size,
         shuffle=False,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=_pin,
     )
 
     test_dataloader = DataLoader(
         test_dataset,
         batch_size=training_config.eval_batch_size,
         shuffle=False,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=_pin,
     )
 
     # Create model

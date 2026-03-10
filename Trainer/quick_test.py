@@ -14,7 +14,7 @@ tp = TextPreprocessor()
 ra = ReviewAggregator()
 
 log_print("Loading data...")
-data = load_all_peerread_data('./data', tp, ra)
+data = load_all_peerread_data('../data', tp, ra)
 
 log_print(f"\n{'='*80}")
 log_print(f"FINAL RESULTS: {len(data)} papers loaded")

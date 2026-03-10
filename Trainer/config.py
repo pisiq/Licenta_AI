@@ -70,8 +70,8 @@ class TrainingConfig:
     freeze_backbone_epochs: int = 2  # Freeze encoder for first N epochs
 
     # Early stopping
-    early_stopping_patience: int = 7  # Increased patience for better convergence
-    early_stopping_metric: str = "avg_spearman"  # Average QWK across all dimensions
+    early_stopping_patience: int = 3   # Patience epochs before stopping
+    early_stopping_metric: str = "recommendation_spearman"  # Track only RECOMMENDATION Spearman
 
     # Class weights (only used in classification mode)
     use_class_weights: bool = False  # Disabled for regression
@@ -82,8 +82,8 @@ class TrainingConfig:
     save_steps: int = 1  # Save every epoch
 
     # Paths
-    output_dir: str = "./outputs"
-    log_dir: str = "./logs"
+    output_dir: str = "../outputs"
+    log_dir: str = "../logs"
 
     # Seeds
     seed: int = 42

@@ -1,7 +1,7 @@
 from data_preprocessing import TextPreprocessor, load_peerread_data, PaperReviewDataset, split_data
 
 preprocessor = TextPreprocessor(max_length=10000, min_length=50)
-data = load_peerread_data('./data', preprocessor, verbose=True)
+data = load_peerread_data('../data', preprocessor, verbose=True)
 
 print("TOTAL=" + str(len(data)))
 s = data[0]

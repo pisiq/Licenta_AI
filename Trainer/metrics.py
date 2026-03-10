@@ -145,8 +145,14 @@ def compute_multi_task_metrics(
     for metric_name, values in all_metrics.items():
         results['macro_avg'][metric_name] = np.mean(values)
 
-    # Set primary metric
+    # Primary metric: average QWK across all dimensions
     results['avg_qwk'] = results['macro_avg'].get('qwk', 0.0)
+
+    # Expose RECOMMENDATION-specific metrics as top-level keys (used by early stopping)
+    rec_metrics = results['per_dimension'].get('RECOMMENDATION', {})
+    results['recommendation_spearman'] = rec_metrics.get('spearman', 0.0)
+    results['recommendation_qwk']      = rec_metrics.get('qwk', 0.0)
+    results['recommendation_mae']      = rec_metrics.get('mae', 5.0)
 
     return results
 

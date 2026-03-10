@@ -1,6 +1,6 @@
 import json, sys
 
-path = r'C:\Facultate\Licenta\data\acl_2017\dev\parsed_pdfs\173.pdf.json'
+path = r'/data/acl_2017/dev/parsed_pdfs/173.pdf.json'
 with open(path, encoding='utf-8') as f:
     d = json.load(f)
 

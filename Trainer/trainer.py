@@ -143,7 +143,7 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
 
-        progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch}")
+        progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch}", dynamic_ncols=True, leave=True)
 
         for batch_idx, batch in enumerate(progress_bar):
             # Move to device
@@ -220,8 +220,13 @@ class Trainer:
             total_loss += loss.item()
             num_batches += 1
 
-            # Update progress bar
-            progress_bar.set_postfix({'loss': loss.item()})
+            # Update progress bar with total + RECOMMENDATION loss
+            per_task = outputs.get('per_task_loss', {})
+            rec_loss = per_task.get('RECOMMENDATION', None)
+            postfix = {'loss': f"{loss.item():.4f}"}
+            if rec_loss is not None:
+                postfix['rec'] = f"{rec_loss.item():.4f}"
+            progress_bar.set_postfix(postfix)
 
             # Logging
             if self.logger and (batch_idx + 1) % self.config.logging_steps == 0:
@@ -319,46 +324,52 @@ class Trainer:
             # TensorBoard logging
             if self.logger:
                 self.logger.add_scalar('train/epoch_loss', train_loss, epoch)
+                # Recommendation-specific (primary target)
+                self.logger.add_scalar('dev/recommendation_spearman', dev_metrics.get('recommendation_spearman', 0.0), epoch)
+                self.logger.add_scalar('dev/recommendation_qwk',      dev_metrics.get('recommendation_qwk', 0.0),      epoch)
+                self.logger.add_scalar('dev/recommendation_mae',       dev_metrics.get('recommendation_mae', 5.0),       epoch)
+                # All-dimension averages (secondary, for context)
                 self.logger.add_scalar('dev/avg_qwk', dev_metrics['avg_qwk'], epoch)
                 for metric_name, value in dev_metrics['macro_avg'].items():
-                    self.logger.add_scalar(f'dev/{metric_name}', value, epoch)
+                    self.logger.add_scalar(f'dev/macro_{metric_name}', value, epoch)
 
             # ------------------------------------------------------------------
-            # Early stopping — composite score:
-            #   primary  : avg_qwk   (0 when collapsed, positive once learning)
-            #   secondary: avg_spearman (tracks rank order even before QWK improves)
-            #   tertiary : -avg_mae  (lower MAE = better, so negate it)
-            # Weighted sum so the model always makes "progress" signals visible.
+            # Early stopping — track RECOMMENDATION Spearman ONLY.
+            # The model is judged solely on how well it ranks papers by their
+            # recommendation score; the 7 auxiliary dimensions help train but
+            # do not influence the stopping criterion.
             # ------------------------------------------------------------------
-            avg_qwk      = dev_metrics.get('avg_qwk', 0.0)
-            avg_spearman = dev_metrics['macro_avg'].get('spearman', 0.0)
-            avg_mae      = dev_metrics['macro_avg'].get('mae', 5.0)
-            # Composite: QWK dominates once it improves, but MAE/Spearman give
-            # signal while QWK is still flat.
-            composite_score = (2.0 * avg_qwk) + (0.5 * avg_spearman) + (-0.3 * avg_mae)
+            rec_spearman = dev_metrics.get('recommendation_spearman', 0.0)
+            rec_qwk      = dev_metrics.get('recommendation_qwk', 0.0)
+            rec_mae      = dev_metrics.get('recommendation_mae', 5.0)
 
-            if composite_score > self.best_score:
-                self.best_score = composite_score
+            # Use Spearman as the primary signal (works even before QWK improves)
+            current_score = rec_spearman
+
+            if current_score > self.best_score:
+                self.best_score = current_score
                 self.patience_counter = 0
                 # Save best model
                 self.best_model_state = {
                     'epoch': epoch,
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
-                    'avg_qwk': avg_qwk,
-                    'composite_score': composite_score,
+                    'recommendation_spearman': rec_spearman,
+                    'recommendation_qwk': rec_qwk,
+                    'recommendation_mae': rec_mae,
                     'metrics': dev_metrics
                 }
-                print(f"\n[BEST] New best model! QWK={avg_qwk:.4f}  "
-                      f"Spearman={avg_spearman:.4f}  MAE={avg_mae:.4f}  "
-                      f"Composite={composite_score:.4f}")
+                print(f"\n[BEST] New best model!  "
+                      f"RECOMMENDATION → Spearman={rec_spearman:.4f}  "
+                      f"QWK={rec_qwk:.4f}  MAE={rec_mae:.4f}")
 
                 # Save checkpoint
                 self.save_checkpoint(epoch, is_best=True)
             else:
                 self.patience_counter += 1
-                print(f"\nNo improvement. Patience: {self.patience_counter}/{self.config.early_stopping_patience}"
-                      f"  (score={composite_score:.4f}, best={self.best_score:.4f})")
+                print(f"\nNo improvement in RECOMMENDATION Spearman. "
+                      f"Patience: {self.patience_counter}/{self.config.early_stopping_patience}"
+                      f"  (Spearman={rec_spearman:.4f}, best={self.best_score:.4f})")
 
                 if self.patience_counter >= self.config.early_stopping_patience:
                     print(f"\n[STOP] Early stopping triggered after {epoch + 1} epochs")
@@ -371,8 +382,8 @@ class Trainer:
         print("\n" + "="*80)
         print("Training completed!")
         best_epoch, best_qwk = self.metrics_tracker.get_best_metrics()
-        print(f"Best model: Epoch {best_epoch + 1}, Avg QWK: {best_qwk:.4f}  "
-              f"(composite score: {self.best_score:.4f})")
+        print(f"Best model: Epoch {best_epoch + 1}  "
+              f"(RECOMMENDATION Spearman: {self.best_score:.4f}  |  Avg QWK: {best_qwk:.4f})")
         print("="*80)
 
         # Load best model

@@ -3,7 +3,7 @@ from data_preprocessing import load_peerread_data, TextPreprocessor, PEERREAD_AL
 
 tp = TextPreprocessor(max_length=5000, min_length=50)
 data = load_peerread_data(
-    base_data_path='./data',
+    base_data_path='../data',
     text_preprocessor=tp,
     require_pdf=True,
     verbose=True,
