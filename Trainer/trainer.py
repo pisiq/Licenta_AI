@@ -47,7 +47,8 @@ def compute_class_weights(
             if dim in sample['labels']:
                 label = sample['labels'][dim]
                 if label >= 0:  # Valid label
-                    class_counts[dim][label] += 1
+                    label_int = int(np.clip(np.round(float(label)), 1, num_classes)) - 1
+                    class_counts[dim][label_int] += 1
 
     # Compute weights (inverse frequency)
     class_weights = {}
@@ -273,13 +274,15 @@ class Trainer:
 
                     if self.model.use_regression:
                         preds = predictions[dim].cpu().numpy()
+                        labels_valid = dim_labels
                     else:
-                        preds = torch.argmax(predictions[dim], dim=-1).cpu().numpy()
+                        preds = torch.argmax(predictions[dim], dim=-1).cpu().numpy() + 1
+                        labels_valid = np.clip(np.round(dim_labels), 1, self.model.num_classes)
 
                     # Only keep samples with a valid (non-NaN, >= 1) label
                     valid_mask = (~np.isnan(dim_labels)) & (dim_labels >= 1)
                     all_predictions[dim].extend(preds[valid_mask])
-                    all_labels[dim].extend(dim_labels[valid_mask])
+                    all_labels[dim].extend(labels_valid[valid_mask])
 
         # Convert to numpy arrays
         all_predictions = {dim: np.array(preds) for dim, preds in all_predictions.items()}
@@ -328,6 +331,9 @@ class Trainer:
                 self.logger.add_scalar('dev/recommendation_spearman', dev_metrics.get('recommendation_spearman', 0.0), epoch)
                 self.logger.add_scalar('dev/recommendation_qwk',      dev_metrics.get('recommendation_qwk', 0.0),      epoch)
                 self.logger.add_scalar('dev/recommendation_mae',       dev_metrics.get('recommendation_mae', 5.0),       epoch)
+                self.logger.add_scalar('dev/recommendation_accuracy',  dev_metrics.get('recommendation_accuracy', 0.0),  epoch)
+                self.logger.add_scalar('dev/recommendation_macro_f1',  dev_metrics.get('recommendation_macro_f1', 0.0),  epoch)
+                self.logger.add_scalar('dev/recommendation_rmse',      dev_metrics.get('recommendation_rmse', 0.0),      epoch)
                 # All-dimension averages (secondary, for context)
                 self.logger.add_scalar('dev/avg_qwk', dev_metrics['avg_qwk'], epoch)
                 for metric_name, value in dev_metrics['macro_avg'].items():

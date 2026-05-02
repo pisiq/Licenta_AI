@@ -2,7 +2,7 @@
 Evaluation metrics for ordinal classification.
 """
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, cohen_kappa_score
 from scipy.stats import spearmanr
 
@@ -97,7 +97,7 @@ def compute_multi_task_metrics(
     labels: Dict[str, np.ndarray],
     score_dimensions: List[str],
     is_regression: bool = True
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Compute metrics for all score dimensions.
 
@@ -153,6 +153,9 @@ def compute_multi_task_metrics(
     results['recommendation_spearman'] = rec_metrics.get('spearman', 0.0)
     results['recommendation_qwk']      = rec_metrics.get('qwk', 0.0)
     results['recommendation_mae']      = rec_metrics.get('mae', 5.0)
+    results['recommendation_accuracy'] = rec_metrics.get('accuracy', 0.0)
+    results['recommendation_macro_f1'] = rec_metrics.get('macro_f1', 0.0)
+    results['recommendation_rmse']     = rec_metrics.get('rmse', 0.0)
 
     return results
 
@@ -250,4 +253,3 @@ class MetricsTracker:
     def get_best_metrics(self) -> Tuple[int, float]:
         """Get best epoch and QWK score."""
         return self.history['best_epoch'], self.history['best_avg_qwk']
-

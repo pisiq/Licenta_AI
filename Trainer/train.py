@@ -109,7 +109,7 @@ def main(args):
     if args.use_all_data:
         print("\n[*] Loading ALL PeerRead data (ACL 2017, CoNLL 2016, ICLR 2017-2020)...")
         all_data = load_peerread_data(
-            base_data_path    ='../data',
+            base_data_path    ='data',
             text_preprocessor = text_preprocessor,
             conference_folders = PEERREAD_ALL_CONFERENCES,
             require_pdf       = True,
@@ -224,7 +224,10 @@ def main(args):
         score_dimensions=model_config.score_dimensions,
         num_classes=model_config.num_classes,
         dropout=model_config.hidden_dropout_prob,
-        use_regression=model_config.use_regression
+        use_regression=model_config.use_regression,
+        use_aux_regression=model_config.use_aux_regression,
+        aux_regression_weight=model_config.aux_regression_weight,
+        aux_regression_loss=model_config.aux_regression_loss,
     )
 
     model.to(device)
@@ -307,13 +310,22 @@ def main(args):
                 pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, 5)
             else:
                 lab_int, pred_int = np.array([], dtype=int), np.array([], dtype=int)
-            all_labels_rounded[dim]      = lab_int
-            all_predictions_rounded[dim] = pred_int
+            all_labels_rounded[dim]      = lab_int - 1
+            all_predictions_rounded[dim] = pred_int - 1
     else:
-        all_predictions_rounded = {dim: np.round(all_predictions[dim]).astype(int)
-                                   for dim in model_config.score_dimensions}
-        all_labels_rounded      = {dim: np.round(all_labels[dim]).astype(int)
-                                   for dim in model_config.score_dimensions}
+        all_predictions_rounded = {}
+        all_labels_rounded = {}
+        for dim in model_config.score_dimensions:
+            lab = all_labels[dim]
+            pred = all_predictions[dim]
+            valid_mask = (~np.isnan(lab)) & (lab >= 1)
+            if valid_mask.sum() > 0:
+                lab_int = np.clip(np.round(lab[valid_mask]).astype(int), 1, 5)
+                pred_int = np.clip(np.round(pred[valid_mask]).astype(int) + 1, 1, 5)
+            else:
+                lab_int, pred_int = np.array([], dtype=int), np.array([], dtype=int)
+            all_labels_rounded[dim]      = lab_int - 1
+            all_predictions_rounded[dim] = pred_int - 1
 
     confusion_matrices = compute_confusion_matrices(
         all_predictions_rounded,

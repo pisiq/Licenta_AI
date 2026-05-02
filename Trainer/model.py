@@ -72,13 +72,19 @@ class MultiTaskOrdinalClassifier(nn.Module):
         score_dimensions: List[str],
         num_classes: int = 5,  # Kept for compatibility, not used in regression
         dropout: float = 0.1,
-        use_regression: bool = True
+        use_regression: bool = True,
+        use_aux_regression: bool = False,
+        aux_regression_weight: float = 0.0,
+        aux_regression_loss: str = "huber",
     ):
         super().__init__()
 
         self.score_dimensions = score_dimensions
         self.num_classes = num_classes
         self.use_regression = use_regression
+        self.use_aux_regression = use_aux_regression
+        self.aux_regression_weight = float(aux_regression_weight)
+        self.aux_regression_loss = aux_regression_loss
 
         # Load pre-trained transformer
         self.config = AutoConfig.from_pretrained(base_model_name)
@@ -93,11 +99,17 @@ class MultiTaskOrdinalClassifier(nn.Module):
                 for dim in score_dimensions
             })
         else:
-            # Keep classification for backward compatibility
+            # Classification heads
             self.heads = nn.ModuleDict({
                 dim: ClassificationHead(hidden_size, num_classes, dropout)
                 for dim in score_dimensions
             })
+
+    def _expected_score(self, logits: torch.Tensor) -> torch.Tensor:
+        """Compute expected score in [1, num_classes] from class logits."""
+        probs = torch.softmax(logits, dim=-1)
+        idx = torch.arange(1, self.num_classes + 1, device=logits.device, dtype=probs.dtype)
+        return torch.sum(probs * idx, dim=-1)
 
     def forward(
         self,
@@ -153,7 +165,17 @@ class MultiTaskOrdinalClassifier(nn.Module):
             primary_loss   = None
             aux_losses     = []
 
-            loss_fn = nn.HuberLoss(reduction='none', delta=1.0) if self.use_regression else None
+            if self.use_regression:
+                loss_fn = nn.HuberLoss(reduction='none', delta=1.0)
+            else:
+                loss_fn = None
+
+            reg_aux_fn = None
+            if (not self.use_regression) and self.use_aux_regression and self.aux_regression_weight > 0:
+                if self.aux_regression_loss.lower() == "mse":
+                    reg_aux_fn = nn.MSELoss(reduction='none')
+                else:
+                    reg_aux_fn = nn.HuberLoss(reduction='none', delta=1.0)
 
             for dim in self.score_dimensions:
                 if dim not in labels:
@@ -171,12 +193,19 @@ class MultiTaskOrdinalClassifier(nn.Module):
                 if self.use_regression:
                     dim_loss = loss_fn(dim_preds[valid_mask], dim_labels[valid_mask]).mean()
                 else:
-                    dim_labels_int = dim_labels.long()
+                    dim_labels_int = torch.round(dim_labels).clamp(1, self.num_classes).long() - 1
                     cls_weight = class_weights.get(dim) if class_weights else None
                     if cls_weight is not None:
                         cls_weight = cls_weight.to(dim_preds.device)
                     ce_fn    = nn.CrossEntropyLoss(weight=cls_weight, reduction='none')
-                    dim_loss = ce_fn(dim_preds[valid_mask], dim_labels_int[valid_mask]).mean()
+                    ce_loss  = ce_fn(dim_preds[valid_mask], dim_labels_int[valid_mask]).mean()
+                    dim_loss = ce_loss
+
+                    if reg_aux_fn is not None:
+                        expected = self._expected_score(dim_preds[valid_mask])
+                        reg_targets = dim_labels[valid_mask].clamp(1.0, float(self.num_classes))
+                        reg_loss = reg_aux_fn(expected, reg_targets).mean()
+                        dim_loss = ce_loss + (self.aux_regression_weight * reg_loss)
 
                 losses[dim] = dim_loss
 
@@ -252,6 +281,9 @@ class MultiTaskOrdinalClassifier(nn.Module):
             Dictionary of {dimension: [num_classes] probability distribution}
         """
         self.eval()
+
+        if self.use_regression:
+            raise ValueError("predict_probabilities is only available in classification mode.")
 
         with torch.no_grad():
             # Ensure batch dimension

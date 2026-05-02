@@ -171,10 +171,13 @@ def predict_scores(
         outputs   = model(input_ids=input_ids, attention_mask=attention_mask)
         raw_preds = outputs["predictions"]
 
-    scores = {
-        dim: float(raw_preds[dim].squeeze().cpu().item())
-        for dim in model_config.score_dimensions
-    }
+    scores = {}
+    for dim, pred in raw_preds.items():
+        if model_config.use_regression:
+            scores[dim] = float(pred.squeeze().cpu().item())
+        else:
+            pred_class = torch.argmax(pred, dim=-1).item()
+            scores[dim] = float(pred_class + 1)
     return scores, title, abstract, body
 
 

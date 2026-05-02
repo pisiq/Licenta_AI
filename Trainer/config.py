@@ -14,13 +14,16 @@ class ModelConfig:
 
     # For hierarchical encoding if needed
     use_hierarchical: bool = False
-    use_regression: bool = True  # Use regression instead of classification
+    use_regression: bool = False  # Classification is primary output
+    use_aux_regression: bool = True  # Regression helps classification during training
+    aux_regression_weight: float = 0.2  # Weight for auxiliary regression loss
+    aux_regression_loss: str = "huber"  # "huber" or "mse"
     chunk_size: int = 512
     chunk_overlap: int = 50
 
     # Task dimensions
     score_dimensions: List[str] = None
-    num_classes: int = 5  # Scores from 1 to 5 (used for metrics, not model output in regression mode)
+    num_classes: int = 5  # Scores from 1 to 5 (classification outputs 0-4)
 
     # Model architecture
     hidden_dropout_prob: float = 0.1
@@ -74,7 +77,7 @@ class TrainingConfig:
     early_stopping_metric: str = "recommendation_spearman"  # Track only RECOMMENDATION Spearman
 
     # Class weights (only used in classification mode)
-    use_class_weights: bool = False  # Disabled for regression
+    use_class_weights: bool = False  # Enable to handle class imbalance
 
     # Logging
     logging_steps: int = 10  # More frequent logging
