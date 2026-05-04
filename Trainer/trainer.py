@@ -74,7 +74,7 @@ class Trainer:
         self,
         model: MultiTaskOrdinalClassifier,
         train_dataloader: DataLoader,
-        dev_dataloader: DataLoader,
+        dev_dataloader: Optional[DataLoader],
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
         device: torch.device,
@@ -303,7 +303,10 @@ class Trainer:
         print("Starting training...")
         print(f"Number of epochs: {num_epochs}")
         print(f"Train batches: {len(self.train_dataloader)}")
-        print(f"Dev batches: {len(self.dev_dataloader)}")
+        if self.dev_dataloader is not None:
+            print(f"Dev batches: {len(self.dev_dataloader)}")
+        else:
+            print("Dev batches: 0 (dev disabled; using test only)")
 
         for epoch in range(num_epochs):
             print(f"\n{'='*80}")
@@ -314,62 +317,67 @@ class Trainer:
             train_loss = self.train_epoch(epoch)
             print(f"\nTrain Loss: {train_loss:.4f}")
 
-            # Evaluate on dev set
-            print("\nEvaluating on dev set...")
-            dev_metrics = self.evaluate(self.dev_dataloader)
+            # Evaluate on dev set (if provided)
+            if self.dev_dataloader is not None:
+                print("\nEvaluating on dev set...")
+                dev_metrics = self.evaluate(self.dev_dataloader)
 
-            # Log metrics
-            print(self.metrics_tracker.format_metrics(dev_metrics, "Dev Set Metrics"))
+                # Log metrics
+                print(self.metrics_tracker.format_metrics(dev_metrics, "Dev Set Metrics"))
 
-            # Update tracker
-            self.metrics_tracker.update(epoch, train_loss, dev_metrics)
+                # Update tracker
+                self.metrics_tracker.update(epoch, train_loss, dev_metrics)
 
-            # TensorBoard logging
-            if self.logger:
-                self.logger.add_scalar('train/epoch_loss', train_loss, epoch)
-                # Recommendation-specific (primary target)
-                self.logger.add_scalar('dev/recommendation_spearman', dev_metrics.get('recommendation_spearman', 0.0), epoch)
-                self.logger.add_scalar('dev/recommendation_qwk',      dev_metrics.get('recommendation_qwk', 0.0),      epoch)
-                self.logger.add_scalar('dev/recommendation_mae',       dev_metrics.get('recommendation_mae', 5.0),       epoch)
-                self.logger.add_scalar('dev/recommendation_accuracy',  dev_metrics.get('recommendation_accuracy', 0.0),  epoch)
-                self.logger.add_scalar('dev/recommendation_macro_f1',  dev_metrics.get('recommendation_macro_f1', 0.0),  epoch)
-                self.logger.add_scalar('dev/recommendation_rmse',      dev_metrics.get('recommendation_rmse', 0.0),      epoch)
-                # All-dimension averages (secondary, for context)
-                self.logger.add_scalar('dev/avg_qwk', dev_metrics['avg_qwk'], epoch)
-                for metric_name, value in dev_metrics['macro_avg'].items():
-                    self.logger.add_scalar(f'dev/macro_{metric_name}', value, epoch)
+                # TensorBoard logging
+                if self.logger:
+                    self.logger.add_scalar('train/epoch_loss', train_loss, epoch)
+                    # Recommendation-specific (primary target)
+                    self.logger.add_scalar('dev/recommendation_spearman', dev_metrics.get('recommendation_spearman', 0.0), epoch)
+                    self.logger.add_scalar('dev/recommendation_qwk',      dev_metrics.get('recommendation_qwk', 0.0),      epoch)
+                    self.logger.add_scalar('dev/recommendation_mae',       dev_metrics.get('recommendation_mae', 5.0),       epoch)
+                    self.logger.add_scalar('dev/recommendation_accuracy',  dev_metrics.get('recommendation_accuracy', 0.0),  epoch)
+                    self.logger.add_scalar('dev/recommendation_macro_f1',  dev_metrics.get('recommendation_macro_f1', 0.0),  epoch)
+                    self.logger.add_scalar('dev/recommendation_rmse',      dev_metrics.get('recommendation_rmse', 0.0),      epoch)
+                    # All-dimension averages (secondary, for context)
+                    self.logger.add_scalar('dev/avg_qwk', dev_metrics['avg_qwk'], epoch)
+                    self.logger.add_scalar('dev/avg_accuracy', dev_metrics.get('macro_avg', {}).get('accuracy', 0.0), epoch)
+                    for metric_name, value in dev_metrics['macro_avg'].items():
+                        self.logger.add_scalar(f'dev/macro_{metric_name}', value, epoch)
 
-            # ------------------------------------------------------------------
-            # Early stopping — use the configured metric on RECOMMENDATION.
-            # ------------------------------------------------------------------
-            metric_key = getattr(self.config, 'early_stopping_metric', 'recommendation_spearman')
-            current_score = dev_metrics.get(metric_key, 0.0)
+                # ------------------------------------------------------------------
+                # Early stopping — use the configured metric on RECOMMENDATION.
+                # ------------------------------------------------------------------
+                metric_key = getattr(self.config, 'early_stopping_metric', 'recommendation_spearman')
+                current_score = dev_metrics.get(metric_key, 0.0)
 
-            if current_score > self.best_score:
-                self.best_score = current_score
-                self.patience_counter = 0
-                # Save best model
-                self.best_model_state = {
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'best_metric': metric_key,
-                    'best_score': current_score,
-                    'metrics': dev_metrics
-                }
-                print(f"\n[BEST] New best model!  {metric_key}={current_score:.4f}")
+                if current_score > self.best_score:
+                    self.best_score = current_score
+                    self.patience_counter = 0
+                    # Save best model
+                    self.best_model_state = {
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'best_metric': metric_key,
+                        'best_score': current_score,
+                        'metrics': dev_metrics
+                    }
+                    print(f"\n[BEST] New best model!  {metric_key}={current_score:.4f}")
 
-                # Save checkpoint
-                self.save_checkpoint(epoch, is_best=True)
+                    # Save checkpoint
+                    self.save_checkpoint(epoch, is_best=True)
+                else:
+                    self.patience_counter += 1
+                    print(f"\nNo improvement in {metric_key}. "
+                          f"Patience: {self.patience_counter}/{self.config.early_stopping_patience}"
+                          f"  ({metric_key}={current_score:.4f}, best={self.best_score:.4f})")
+
+                    if self.patience_counter >= self.config.early_stopping_patience:
+                        print(f"\n[STOP] Early stopping triggered after {epoch + 1} epochs")
+                        break
             else:
-                self.patience_counter += 1
-                print(f"\nNo improvement in {metric_key}. "
-                      f"Patience: {self.patience_counter}/{self.config.early_stopping_patience}"
-                      f"  ({metric_key}={current_score:.4f}, best={self.best_score:.4f})")
-
-                if self.patience_counter >= self.config.early_stopping_patience:
-                    print(f"\n[STOP] Early stopping triggered after {epoch + 1} epochs")
-                    break
+                if self.logger:
+                    self.logger.add_scalar('train/epoch_loss', train_loss, epoch)
 
             # Save periodic checkpoint
             if (epoch + 1) % self.config.save_steps == 0:
@@ -377,15 +385,28 @@ class Trainer:
 
         print("\n" + "="*80)
         print("Training completed!")
-        best_epoch, best_qwk = self.metrics_tracker.get_best_metrics()
-        print(f"Best model: Epoch {best_epoch + 1}  "
-              f"({metric_key}: {self.best_score:.4f}  |  Avg QWK: {best_qwk:.4f})")
+        if self.dev_dataloader is not None:
+            best_epoch, best_qwk = self.metrics_tracker.get_best_metrics()
+            metric_key = getattr(self.config, 'early_stopping_metric', 'recommendation_spearman')
+            print(f"Best model: Epoch {best_epoch + 1}  "
+                  f"({metric_key}: {self.best_score:.4f}  |  Avg QWK: {best_qwk:.4f})")
+        else:
+            print("Best model: dev disabled; keeping last epoch weights")
         print("="*80)
 
         # Load best model
         if self.best_model_state:
             self.model.load_state_dict(self.best_model_state['model_state_dict'])
             print("\n[OK] Best model loaded")
+        elif self.dev_dataloader is None:
+            self.best_model_state = {
+                'epoch': num_epochs - 1,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'best_metric': None,
+                'best_score': None,
+                'metrics': None
+            }
 
         return self.best_model_state
 
@@ -470,4 +491,3 @@ def create_optimizer_and_scheduler(
     print(f"[OK] Scheduler: Linear warmup ({num_warmup_steps} steps / {config.warmup_ratio*100:.0f}%) + decay ({num_training_steps} total steps)")
 
     return optimizer, scheduler
-

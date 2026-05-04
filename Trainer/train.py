@@ -126,7 +126,7 @@ def main(args):
         print(f"Loaded {len(all_data)} papers with reviews")
 
     # Split data
-    train_data, dev_data, test_data = split_data(
+    train_data, _dev_data, test_data = split_data(
         all_data,
         train_ratio=data_config.train_split,
         dev_ratio=data_config.dev_split,
@@ -136,7 +136,6 @@ def main(args):
 
     print(f"\n[*] Data split:")
     print(f"  Train: {len(train_data)} papers")
-    print(f"  Dev: {len(dev_data)} papers")
     print(f"  Test: {len(test_data)} papers")
 
     # Load tokenizer
@@ -145,7 +144,6 @@ def main(args):
 
     # Create datasets
     # train : paper + review  -> model learns what paper content earns what score
-    # dev   : paper only      -> evaluation mirrors real-world inference
     # test  : paper only      -> final test mirrors real-world inference
     effective_dims = model_config.score_dimensions or SCORE_DIMENSIONS
     train_dataset = PaperReviewDataset(
@@ -154,14 +152,6 @@ def main(args):
         max_length=model_config.max_length,
         score_dimensions=effective_dims,
         inference_mode=False   # training: paper + review
-    )
-
-    dev_dataset = PaperReviewDataset(
-        dev_data,
-        tokenizer,
-        max_length=model_config.max_length,
-        score_dimensions=effective_dims,
-        inference_mode=True    # eval: paper only (no review leakage)
     )
 
     test_dataset = PaperReviewDataset(
@@ -193,15 +183,6 @@ def main(args):
         train_dataset,
         batch_size=training_config.train_batch_size,
         shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=0,
-        pin_memory=_pin,
-    )
-
-    dev_dataloader = DataLoader(
-        dev_dataset,
-        batch_size=training_config.eval_batch_size,
-        shuffle=False,
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=_pin,
@@ -248,7 +229,7 @@ def main(args):
     trainer = Trainer(
         model=model,
         train_dataloader=train_dataloader,
-        dev_dataloader=dev_dataloader,
+        dev_dataloader=None,
         optimizer=optimizer,
         scheduler=scheduler,
         device=device,
@@ -267,6 +248,16 @@ def main(args):
 
     test_metrics = trainer.evaluate(test_dataloader)
     print(trainer.metrics_tracker.format_metrics(test_metrics, "Test Set Metrics"))
+
+    if logger:
+        step = training_config.num_epochs
+        logger.add_scalar('test/recommendation_spearman', test_metrics.get('recommendation_spearman', 0.0), step)
+        logger.add_scalar('test/recommendation_qwk',      test_metrics.get('recommendation_qwk', 0.0),      step)
+        logger.add_scalar('test/recommendation_mae',       test_metrics.get('recommendation_mae', 5.0),       step)
+        logger.add_scalar('test/recommendation_accuracy',  test_metrics.get('recommendation_accuracy', 0.0),  step)
+        logger.add_scalar('test/recommendation_macro_f1',  test_metrics.get('recommendation_macro_f1', 0.0),  step)
+        logger.add_scalar('test/recommendation_rmse',      test_metrics.get('recommendation_rmse', 0.0),      step)
+        logger.add_scalar('test/avg_accuracy', test_metrics.get('macro_avg', {}).get('accuracy', 0.0), step)
 
     # Compute confusion matrices (for rounded predictions in regression mode)
     print("\nComputing confusion matrices...")
@@ -378,4 +369,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
-

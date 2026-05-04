@@ -58,7 +58,7 @@ class TrainingConfig:
 
     # Training schedule
     num_epochs: int = 20
-    train_batch_size: int = 1  # Small batch size for 8GB VRAM
+    train_batch_size: int = 2  # Small batch size for 8GB VRAM
     eval_batch_size: int = 4
     gradient_accumulation_steps: int = 8  # Effective batch size = 1 * 8 = 8
 
@@ -111,4 +111,3 @@ class DataConfig:
     aggregation_method: str = "mean_round"  # mean then round to nearest int
     min_label: int = 1
     max_label: int = 5
-

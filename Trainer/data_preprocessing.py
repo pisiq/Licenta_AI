@@ -577,7 +577,7 @@ def split_data(
         folders or from the ICLR auto-split), use them directly.
       • Otherwise fall back to a random shuffle.
 
-    If dev_ratio == 0, dev is treated as test (no separate dev set).
+    Dev is removed from the pipeline; the dev split is treated as test.
     """
     has_predef = any(s.split in ("train", "dev", "test") for s in data)
     train_has = any(s.split == "train" for s in data)
@@ -586,22 +586,15 @@ def split_data(
     if has_predef and train_has and dev_has:
         train = [s for s in data if s.split in ("train", "test")]
         test = [s for s in data if s.split == "dev"]
-        dev = test
+        dev = []
         return train, dev, test
 
     np.random.seed(seed)
     indices = np.random.permutation(len(data))
     n_train = int(len(data) * train_ratio)
-    n_dev = int(len(data) * dev_ratio)
 
-    if n_dev == 0:
-        train = [data[i] for i in indices[:n_train]]
-        test = [data[i] for i in indices[n_train:]]
-        dev = test
-    else:
-        train = [data[i] for i in indices[:n_train]]
-        dev = [data[i] for i in indices[n_train:n_train + n_dev]]
-        test = [data[i] for i in indices[n_train + n_dev:]]
+    train = [data[i] for i in indices[:n_train]]
+    test = [data[i] for i in indices[n_train:]]
+    dev = []
 
     return train, dev, test
-
