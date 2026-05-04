@@ -67,4 +67,3 @@ class GenerationResponse(ApiResponse):
 class PipelineResponse(ApiResponse):
     data: ScoringResult
     review_text: str = ""
-

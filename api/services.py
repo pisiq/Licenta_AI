@@ -143,4 +143,3 @@ def model_version() -> str:
 	return f"scoring={scoring_name};generator={generator_name}"
 
 
-

@@ -340,17 +340,10 @@ class Trainer:
                     self.logger.add_scalar(f'dev/macro_{metric_name}', value, epoch)
 
             # ------------------------------------------------------------------
-            # Early stopping — track RECOMMENDATION Spearman ONLY.
-            # The model is judged solely on how well it ranks papers by their
-            # recommendation score; the 7 auxiliary dimensions help train but
-            # do not influence the stopping criterion.
+            # Early stopping — use the configured metric on RECOMMENDATION.
             # ------------------------------------------------------------------
-            rec_spearman = dev_metrics.get('recommendation_spearman', 0.0)
-            rec_qwk      = dev_metrics.get('recommendation_qwk', 0.0)
-            rec_mae      = dev_metrics.get('recommendation_mae', 5.0)
-
-            # Use Spearman as the primary signal (works even before QWK improves)
-            current_score = rec_spearman
+            metric_key = getattr(self.config, 'early_stopping_metric', 'recommendation_spearman')
+            current_score = dev_metrics.get(metric_key, 0.0)
 
             if current_score > self.best_score:
                 self.best_score = current_score
@@ -360,22 +353,19 @@ class Trainer:
                     'epoch': epoch,
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
-                    'recommendation_spearman': rec_spearman,
-                    'recommendation_qwk': rec_qwk,
-                    'recommendation_mae': rec_mae,
+                    'best_metric': metric_key,
+                    'best_score': current_score,
                     'metrics': dev_metrics
                 }
-                print(f"\n[BEST] New best model!  "
-                      f"RECOMMENDATION → Spearman={rec_spearman:.4f}  "
-                      f"QWK={rec_qwk:.4f}  MAE={rec_mae:.4f}")
+                print(f"\n[BEST] New best model!  {metric_key}={current_score:.4f}")
 
                 # Save checkpoint
                 self.save_checkpoint(epoch, is_best=True)
             else:
                 self.patience_counter += 1
-                print(f"\nNo improvement in RECOMMENDATION Spearman. "
+                print(f"\nNo improvement in {metric_key}. "
                       f"Patience: {self.patience_counter}/{self.config.early_stopping_patience}"
-                      f"  (Spearman={rec_spearman:.4f}, best={self.best_score:.4f})")
+                      f"  ({metric_key}={current_score:.4f}, best={self.best_score:.4f})")
 
                 if self.patience_counter >= self.config.early_stopping_patience:
                     print(f"\n[STOP] Early stopping triggered after {epoch + 1} epochs")
@@ -389,7 +379,7 @@ class Trainer:
         print("Training completed!")
         best_epoch, best_qwk = self.metrics_tracker.get_best_metrics()
         print(f"Best model: Epoch {best_epoch + 1}  "
-              f"(RECOMMENDATION Spearman: {self.best_score:.4f}  |  Avg QWK: {best_qwk:.4f})")
+              f"({metric_key}: {self.best_score:.4f}  |  Avg QWK: {best_qwk:.4f})")
         print("="*80)
 
         # Load best model

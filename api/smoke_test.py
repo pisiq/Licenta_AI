@@ -15,4 +15,3 @@ if __name__ == "__main__":
     print("Status:", response.status_code)
     print("Body:", response.json())
 
-

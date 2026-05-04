@@ -10,13 +10,13 @@ class ModelConfig:
     """Model architecture configuration."""
     # Base model
     base_model_name: str = "allenai/longformer-base-4096"
-    max_length: int = 4096
+    max_length: int = 2048
 
     # For hierarchical encoding if needed
-    use_hierarchical: bool = False
+    use_hierarchical: bool = True
     use_regression: bool = False  # Classification is primary output
     use_aux_regression: bool = True  # Regression helps classification during training
-    aux_regression_weight: float = 0.2  # Weight for auxiliary regression loss
+    aux_regression_weight: float = 0.3  # Weight for auxiliary regression loss
     aux_regression_loss: str = "huber"  # "huber" or "mse"
     chunk_size: int = 512
     chunk_overlap: int = 50
@@ -59,7 +59,7 @@ class TrainingConfig:
     # Training schedule
     num_epochs: int = 20
     train_batch_size: int = 1  # Small batch size for 8GB VRAM
-    eval_batch_size: int = 2
+    eval_batch_size: int = 4
     gradient_accumulation_steps: int = 8  # Effective batch size = 1 * 8 = 8
 
     # Mixed precision for memory optimization
@@ -74,10 +74,10 @@ class TrainingConfig:
 
     # Early stopping
     early_stopping_patience: int = 3   # Patience epochs before stopping
-    early_stopping_metric: str = "recommendation_spearman"  # Track only RECOMMENDATION Spearman
+    early_stopping_metric: str = "recommendation_accuracy"  # Primary classification metric
 
     # Class weights (only used in classification mode)
-    use_class_weights: bool = False  # Enable to handle class imbalance
+    use_class_weights: bool = True  # Enable to handle class imbalance
 
     # Logging
     logging_steps: int = 10  # More frequent logging
@@ -98,8 +98,8 @@ class DataConfig:
     # Data paths
     data_path: str = "./data/papers_reviews.json"
     train_split: float = 0.8
-    dev_split: float = 0.1
-    test_split: float = 0.1
+    dev_split: float = 0.0
+    test_split: float = 0.2
 
     # Preprocessing
     max_paper_length: int = 10000  # characters before tokenization

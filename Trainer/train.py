@@ -228,6 +228,8 @@ def main(args):
         use_aux_regression=model_config.use_aux_regression,
         aux_regression_weight=model_config.aux_regression_weight,
         aux_regression_loss=model_config.aux_regression_loss,
+        use_hierarchical=model_config.use_hierarchical,
+        chunk_size=model_config.chunk_size,
     )
 
     model.to(device)

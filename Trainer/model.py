@@ -76,6 +76,8 @@ class MultiTaskOrdinalClassifier(nn.Module):
         use_aux_regression: bool = False,
         aux_regression_weight: float = 0.0,
         aux_regression_loss: str = "huber",
+        use_hierarchical: bool = False,
+        chunk_size: int = 512,
     ):
         super().__init__()
 
@@ -85,10 +87,14 @@ class MultiTaskOrdinalClassifier(nn.Module):
         self.use_aux_regression = use_aux_regression
         self.aux_regression_weight = float(aux_regression_weight)
         self.aux_regression_loss = aux_regression_loss
+        self.use_hierarchical = use_hierarchical
 
         # Load pre-trained transformer
         self.config = AutoConfig.from_pretrained(base_model_name)
-        self.encoder = AutoModel.from_pretrained(base_model_name, config=self.config)
+        if self.use_hierarchical:
+            self.encoder = HierarchicalEncoder(base_model_name, chunk_size=chunk_size)
+        else:
+            self.encoder = AutoModel.from_pretrained(base_model_name, config=self.config)
 
         hidden_size = self.config.hidden_size
 
@@ -135,19 +141,22 @@ class MultiTaskOrdinalClassifier(nn.Module):
                 - per_task_loss: Dict of {dimension: scalar} (if labels provided)
         """
         # Encode text
-        outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True
-        )
-
-        # Get pooled representation (CLS token or mean pooling)
-        if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
-            pooled_output = outputs.pooler_output
+        if self.use_hierarchical:
+            pooled_output = self.encoder(input_ids, attention_mask)
         else:
-            # Mean pooling over sequence
-            hidden_states = outputs.last_hidden_state
-            pooled_output = (hidden_states * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(1, keepdim=True)
+            outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True
+            )
+
+            # Get pooled representation (CLS token or mean pooling)
+            if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+                pooled_output = outputs.pooler_output
+            else:
+                # Mean pooling over sequence
+                hidden_states = outputs.last_hidden_state
+                pooled_output = (hidden_states * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(1, keepdim=True)
 
         # Compute predictions for each dimension
         predictions = {}
@@ -378,4 +387,3 @@ class HierarchicalEncoder(nn.Module):
             return chunk_embeddings.max(dim=1)[0]
         else:
             raise ValueError(f"Unknown aggregation: {self.aggregation}")
-
