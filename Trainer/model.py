@@ -3,8 +3,61 @@ Multi-task ordinal classification model for scientific paper review scoring.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModel, AutoConfig
 from typing import Dict, Optional, List
+
+
+def ordinal_soft_labels(
+    targets: torch.Tensor,
+    num_classes: int,
+    smoothing: float = 0.1,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Build Laplace-style soft labels that put residual mass on neighbors.
+
+    targets : LongTensor [B] in [0, num_classes-1]
+    returns : FloatTensor [B, num_classes]
+    """
+    idx = torch.arange(num_classes, device=targets.device, dtype=torch.float32)
+    dist = torch.abs(idx.unsqueeze(0) - targets.float().unsqueeze(1))  # [B, C]
+    neighbor = torch.exp(-dist / max(temperature, 1e-6))
+    neighbor = neighbor / neighbor.sum(dim=1, keepdim=True)
+    one_hot = F.one_hot(targets, num_classes=num_classes).float()
+    return (1.0 - smoothing) * one_hot + smoothing * neighbor
+
+
+def focal_ce_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    num_classes: int,
+    alpha: Optional[torch.Tensor] = None,
+    gamma: float = 2.0,
+    smoothing: float = 0.0,
+    smoothing_temperature: float = 1.0,
+) -> torch.Tensor:
+    """Focal cross-entropy with optional ordinal label smoothing and class weights.
+
+    Reduces to weighted CE when gamma=0 and smoothing=0.
+    """
+    log_probs = F.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
+
+    if smoothing > 0.0:
+        soft_targets = ordinal_soft_labels(targets, num_classes, smoothing, smoothing_temperature)
+        ce_per_sample = -(soft_targets * log_probs).sum(dim=-1)
+    else:
+        ce_per_sample = F.nll_loss(log_probs, targets, reduction='none')
+
+    one_hot = F.one_hot(targets, num_classes=num_classes).float()
+    pt = (probs * one_hot).sum(dim=-1).clamp(min=1e-8)
+    focal_weight = (1.0 - pt).pow(gamma) if gamma > 0 else torch.ones_like(pt)
+
+    loss = focal_weight * ce_per_sample
+    if alpha is not None:
+        loss = loss * alpha[targets]
+    return loss.mean()
 
 # Per-dimension loss weights:
 #   RECOMMENDATION is the PRIMARY target  (weight = 1.0, evaluated alone)
@@ -80,6 +133,11 @@ class MultiTaskOrdinalClassifier(nn.Module):
         chunk_size: int = 512,
         regression_decider_enabled: bool = True,
         regression_decider_margin: float = 0.15,
+        use_focal_loss: bool = False,
+        focal_gamma: float = 2.0,
+        use_ordinal_smoothing: bool = False,
+        ordinal_smoothing: float = 0.1,
+        ordinal_smoothing_temperature: float = 1.0,
     ):
         super().__init__()
 
@@ -92,6 +150,11 @@ class MultiTaskOrdinalClassifier(nn.Module):
         self.use_hierarchical = use_hierarchical
         self.regression_decider_enabled = regression_decider_enabled
         self.regression_decider_margin = float(regression_decider_margin)
+        self.use_focal_loss = use_focal_loss
+        self.focal_gamma = float(focal_gamma)
+        self.use_ordinal_smoothing = use_ordinal_smoothing
+        self.ordinal_smoothing = float(ordinal_smoothing)
+        self.ordinal_smoothing_temperature = float(ordinal_smoothing_temperature)
 
         # Load pre-trained transformer
         self.config = AutoConfig.from_pretrained(base_model_name)
@@ -249,8 +312,18 @@ class MultiTaskOrdinalClassifier(nn.Module):
                     cls_weight = class_weights.get(dim) if class_weights else None
                     if cls_weight is not None:
                         cls_weight = cls_weight.to(dim_preds.device)
-                    ce_fn = nn.CrossEntropyLoss(weight=cls_weight, reduction='none')
-                    ce_loss = ce_fn(dim_preds[valid_mask], dim_labels_int[valid_mask]).mean()
+
+                    gamma = self.focal_gamma if self.use_focal_loss else 0.0
+                    smoothing = self.ordinal_smoothing if self.use_ordinal_smoothing else 0.0
+                    ce_loss = focal_ce_loss(
+                        dim_preds[valid_mask],
+                        dim_labels_int[valid_mask],
+                        num_classes=self.num_classes,
+                        alpha=cls_weight,
+                        gamma=gamma,
+                        smoothing=smoothing,
+                        smoothing_temperature=self.ordinal_smoothing_temperature,
+                    )
                     dim_loss = ce_loss
 
                     if reg_aux_fn is not None:

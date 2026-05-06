@@ -2,7 +2,9 @@
 Main training script for multi-task ordinal classification.
 """
 import os
+import sys
 import argparse
+import datetime
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -21,8 +23,62 @@ from data_preprocessing import (
     PEERREAD_ALL_CONFERENCES,
 )
 from model import MultiTaskOrdinalClassifier
-from trainer import Trainer, create_optimizer_and_scheduler, compute_class_weights, set_seed
+from trainer import (
+    Trainer,
+    create_optimizer_and_scheduler,
+    compute_class_weights,
+    make_weighted_sampler,
+    set_seed,
+)
 from metrics import compute_confusion_matrices
+
+
+class _Tee:
+    """Duplicate stdout/stderr writes into a file handle for persistent text logs."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+def _setup_run_dirs(training_config) -> tuple:
+    """Create timestamped run directories and tee stdout/stderr to a log file.
+
+    Returns (run_output_dir, run_log_dir, log_file_handle).
+    """
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_output_dir = os.path.join(training_config.output_dir, f"run_{timestamp}")
+    run_log_dir = os.path.join(training_config.log_dir, f"run_{timestamp}")
+    os.makedirs(run_output_dir, exist_ok=True)
+    os.makedirs(run_log_dir, exist_ok=True)
+
+    log_file_path = os.path.join(run_log_dir, "train.log")
+    log_fh = open(log_file_path, "w", encoding="utf-8", buffering=1)  # line-buffered
+    sys.stdout = _Tee(sys.__stdout__, log_fh)
+    sys.stderr = _Tee(sys.__stderr__, log_fh)
+
+    print(f"[OK] Run output dir : {run_output_dir}")
+    print(f"[OK] Run log dir    : {run_log_dir}")
+    print(f"[OK] Text log file  : {log_file_path}")
+
+    # Repoint training_config so checkpoints land in the per-run folder
+    training_config.output_dir = run_output_dir
+    training_config.log_dir = run_log_dir
+    return run_output_dir, run_log_dir, log_fh
 
 
 def collate_fn(batch):
@@ -83,11 +139,12 @@ def main(args):
     print(f"Device: {device}")
     print(f"{'='*80}\n")
 
-    # Create output directories
+    # Create per-run output/log directories and start text log
     os.makedirs(training_config.output_dir, exist_ok=True)
     os.makedirs(training_config.log_dir, exist_ok=True)
+    _setup_run_dirs(training_config)
 
-    # Initialize TensorBoard logger
+    # Initialize TensorBoard logger (writes into per-run log dir)
     logger = SummaryWriter(training_config.log_dir)
 
     print("Loading and preprocessing data...")
@@ -180,10 +237,23 @@ def main(args):
     # num_workers=0 on Windows (avoids multiprocessing spawn issues)
     # pin_memory=True speeds up CPU→GPU transfers on CUDA
     _pin = device.type == 'cuda'
+
+    train_sampler = None
+    if getattr(training_config, 'use_weighted_sampler', False):
+        print("\nBuilding WeightedRandomSampler for class-balanced batches...")
+        train_sampler = make_weighted_sampler(
+            train_dataset,
+            primary_dim="RECOMMENDATION",
+            num_classes=model_config.num_classes,
+            minority_boost=getattr(training_config, 'sampler_minority_boost', 1.0),
+            minority_classes=(0, 3),
+        )
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=training_config.train_batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=_pin,
@@ -217,6 +287,11 @@ def main(args):
         chunk_size=model_config.chunk_size,
         regression_decider_enabled=model_config.regression_decider_enabled,
         regression_decider_margin=model_config.regression_decider_margin,
+        use_focal_loss=getattr(training_config, 'use_focal_loss', False),
+        focal_gamma=getattr(training_config, 'focal_gamma', 2.0),
+        use_ordinal_smoothing=getattr(training_config, 'use_ordinal_smoothing', False),
+        ordinal_smoothing=getattr(training_config, 'ordinal_smoothing', 0.1),
+        ordinal_smoothing_temperature=getattr(training_config, 'ordinal_smoothing_temperature', 1.0),
     )
 
     model.to(device)

@@ -68,10 +68,23 @@ class TrainingConfig:
 
     # Early stopping
     early_stopping_patience: int = 3   # Patience epochs before stopping
-    early_stopping_metric: str = "recommendation_accuracy"  # Primary classification metric
+    early_stopping_metric: str = "recommendation_qwk"  # Ordinal-aware primary metric
 
     # Class weights (only used in classification mode)
     use_class_weights: bool = True  # Enable to handle class imbalance
+
+    # Focal loss (replaces weighted CE when enabled)
+    use_focal_loss: bool = True
+    focal_gamma: float = 2.0  # Focusing parameter; >0 down-weights easy examples
+
+    # Ordinal label smoothing (Laplace-style soft labels around the true class)
+    use_ordinal_smoothing: bool = True
+    ordinal_smoothing: float = 0.1   # Mass moved from one-hot to neighbor distribution
+    ordinal_smoothing_temperature: float = 1.0  # Sharpness of neighbor distribution
+
+    # Weighted random sampling for minority classes (RECOMMENDATION dim)
+    use_weighted_sampler: bool = True
+    sampler_minority_boost: float = 1.5  # Extra multiplier for classes 0 and 3
 
     # Logging
     logging_steps: int = 25  # More frequent logging

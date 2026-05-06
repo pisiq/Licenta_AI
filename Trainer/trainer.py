@@ -5,7 +5,7 @@ import os
 import torch
 import numpy as np
 from typing import Dict, List, Optional
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
@@ -65,6 +65,57 @@ def compute_class_weights(
         class_weights[dim] = torch.FloatTensor(weights)
 
     return class_weights
+
+
+def make_weighted_sampler(
+    dataset,
+    primary_dim: str = "RECOMMENDATION",
+    num_classes: int = 5,
+    minority_boost: float = 1.5,
+    minority_classes: tuple = (0, 3),
+) -> WeightedRandomSampler:
+    """Build a WeightedRandomSampler that oversamples rare classes.
+
+    Per-sample weight is inverse class frequency (with extra boost for
+    `minority_classes`). Samples with missing labels get weight 0 so they
+    are never drawn.
+    """
+    sample_classes = []
+    counts = np.zeros(num_classes, dtype=np.float64)
+
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        label = sample['labels'].get(primary_dim) if isinstance(sample['labels'], dict) else None
+        if label is None:
+            sample_classes.append(-1)
+            continue
+        label_val = float(label)
+        if np.isnan(label_val) or label_val < 1:
+            sample_classes.append(-1)
+            continue
+        c = int(np.clip(np.round(label_val), 1, num_classes)) - 1
+        counts[c] += 1
+        sample_classes.append(c)
+
+    counts = np.maximum(counts, 1.0)
+    class_w = 1.0 / counts
+    for mc in minority_classes:
+        if 0 <= mc < num_classes:
+            class_w[mc] *= minority_boost
+
+    sample_weights = np.array(
+        [class_w[c] if c >= 0 else 0.0 for c in sample_classes],
+        dtype=np.float64,
+    )
+
+    print(f"[OK] WeightedRandomSampler built — class counts: {counts.astype(int).tolist()}, "
+          f"effective per-class weights: {[f'{w:.4g}' for w in class_w]}")
+
+    return WeightedRandomSampler(
+        weights=torch.from_numpy(sample_weights).double(),
+        num_samples=len(dataset),
+        replacement=True,
+    )
 
 
 class Trainer:

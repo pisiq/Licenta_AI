@@ -558,8 +558,8 @@ def split_data(
     dev_has = any(s.split == "dev" for s in data)
 
     if has_predef and train_has and dev_has:
-        train = [s for s in data if s.split in ("train")]
-        test = [s for s in data if s.split == ("dev", "test")]
+        train = [s for s in data if s.split in ("train","test")]
+        test = [s for s in data if s.split == ("dev" )]
         dev = []
         return train, dev, test
 
