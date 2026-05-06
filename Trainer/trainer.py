@@ -267,6 +267,7 @@ class Trainer:
                     )
 
                 predictions = outputs['predictions']
+                regression_predictions = outputs.get('regression_predictions')
 
                 # Collect predictions and labels  (skip NaN / missing labels)
                 for dim in self.model.score_dimensions:
@@ -276,7 +277,12 @@ class Trainer:
                         preds = predictions[dim].cpu().numpy()
                         labels_valid = dim_labels
                     else:
-                        preds = torch.argmax(predictions[dim], dim=-1).cpu().numpy() + 1
+                        reg_preds = regression_predictions[dim] if regression_predictions is not None else None
+                        pred_classes = self.model.resolve_class_predictions(
+                            predictions[dim],
+                            reg_preds
+                        )
+                        preds = pred_classes.cpu().numpy()
                         labels_valid = np.clip(np.round(dim_labels), 1, self.model.num_classes)
 
                     # Only keep samples with a valid (non-NaN, >= 1) label

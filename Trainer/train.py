@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from torch.utils.tensorboard import SummaryWriter
+import json
 
 from config import ModelConfig, TrainingConfig, DataConfig
 from data_preprocessing import (
@@ -197,6 +198,9 @@ def main(args):
         pin_memory=_pin,
     )
 
+    # Use test split as dev for early stopping/best-model saving
+    dev_dataloader = test_dataloader
+
     # Create model
     print(f"\nInitializing model: {model_config.base_model_name}")
     print(f"Mode: {'Regression' if model_config.use_regression else 'Classification'}")
@@ -211,6 +215,8 @@ def main(args):
         aux_regression_loss=model_config.aux_regression_loss,
         use_hierarchical=model_config.use_hierarchical,
         chunk_size=model_config.chunk_size,
+        regression_decider_enabled=model_config.regression_decider_enabled,
+        regression_decider_margin=model_config.regression_decider_margin,
     )
 
     model.to(device)
@@ -229,7 +235,7 @@ def main(args):
     trainer = Trainer(
         model=model,
         train_dataloader=train_dataloader,
-        dev_dataloader=None,
+        dev_dataloader=dev_dataloader,
         optimizer=optimizer,
         scheduler=scheduler,
         device=device,
@@ -275,14 +281,17 @@ def main(args):
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             predictions = outputs['predictions']
+            regression_predictions = outputs.get('regression_predictions')
 
             for dim in model_config.score_dimensions:
                 if model_config.use_regression:
                     # Continuous predictions - round for confusion matrix
                     preds = predictions[dim].cpu().numpy()
                 else:
-                    # Classification predictions
-                    preds = torch.argmax(predictions[dim], dim=-1).cpu().numpy()
+                    # Classification predictions (regression-guided if enabled)
+                    reg_preds = regression_predictions[dim] if regression_predictions is not None else None
+                    pred_classes = model.resolve_class_predictions(predictions[dim], reg_preds)
+                    preds = pred_classes.cpu().numpy()
                 all_predictions[dim].extend(preds)
                 all_labels[dim].extend(labels[dim].numpy())
 
@@ -314,7 +323,7 @@ def main(args):
             valid_mask = (~np.isnan(lab)) & (lab >= 1)
             if valid_mask.sum() > 0:
                 lab_int = np.clip(np.round(lab[valid_mask]).astype(int), 1, 5)
-                pred_int = np.clip(np.round(pred[valid_mask]).astype(int) + 1, 1, 5)
+                pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, 5)
             else:
                 lab_int, pred_int = np.array([], dtype=int), np.array([], dtype=int)
             all_labels_rounded[dim]      = lab_int - 1
@@ -346,6 +355,18 @@ def main(args):
     results_path = os.path.join(training_config.output_dir, 'test_results.pt')
     torch.save(results, results_path)
     print(f"\n[OK] Test results saved to {results_path}")
+
+    # Save JSON-friendly results for easy inspection
+    json_results = {
+        'test_metrics': test_metrics,
+        'confusion_matrices': {
+            k: v.tolist() for k, v in confusion_matrices.items()
+        },
+    }
+    json_path = os.path.join(training_config.output_dir, 'test_results.json')
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(json_results, f, indent=2)
+    print(f"[OK] Test results JSON saved to {json_path}")
 
     # Close logger
     logger.close()

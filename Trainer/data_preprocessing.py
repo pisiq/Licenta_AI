@@ -16,15 +16,7 @@ ICLR 2017-2020
 
 Task design
 -----------
-Primary target  : RECOMMENDATION  (the score we care about most)
-Auxiliary targets: the other 7 dimensions — used as weighted multi-task
-                  signals for ACL/CoNLL.  ICLR samples have these masked out
-                  (score_mask=False) so the loss ignores them.
-
-Loss weights (used in model.py / trainer.py)
-    RECOMMENDATION        : 3.0   (primary)
-    REVIEWER_CONFIDENCE   : 0.3
-    all others            : 0.5
+Primary target  : RECOMMENDATION (the only score used for training)
 """
 import os
 import re
@@ -37,33 +29,15 @@ from dataclasses import dataclass
 from torch.utils.data import Dataset
 
 # ---------------------------------------------------------------------------
-# Canonical score dimensions (PRIMARY first, then auxiliaries)
+# Canonical score dimensions (PRIMARY only)
 # ---------------------------------------------------------------------------
 SCORE_DIMENSIONS: List[str] = [
-    "RECOMMENDATION",           # PRIMARY — all conferences
-    "IMPACT",                   # auxiliary — ACL / CoNLL only
-    "SUBSTANCE",                # auxiliary — ACL / CoNLL only
-    "APPROPRIATENESS",          # auxiliary — ACL / CoNLL only
-    "MEANINGFUL_COMPARISON",    # auxiliary — ACL / CoNLL only
-    "SOUNDNESS_CORRECTNESS",    # auxiliary — ACL / CoNLL only
-    "ORIGINALITY",              # auxiliary — ACL / CoNLL only
-    "CLARITY",                  # auxiliary — ACL / CoNLL only
-    # NOTE: REVIEWER_CONFIDENCE lives inside the review but is NOT a
-    # paper-quality score so we intentionally exclude it from
-    # SCORE_DIMENSIONS.  This keeps the output head at 7+1 = 8 and avoids
-    # conflating reviewer confidence with paper quality.
+    "RECOMMENDATION",
 ]
 
 # Per-dimension loss weights (used by model.py)
 SCORE_WEIGHTS: Dict[str, float] = {
-    "RECOMMENDATION":        3.0,
-    "IMPACT":                0.5,
-    "SUBSTANCE":             0.5,
-    "APPROPRIATENESS":       0.5,
-    "MEANINGFUL_COMPARISON": 0.5,
-    "SOUNDNESS_CORRECTNESS": 0.5,
-    "ORIGINALITY":           0.5,
-    "CLARITY":               0.5,
+    "RECOMMENDATION": 1.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -584,8 +558,8 @@ def split_data(
     dev_has = any(s.split == "dev" for s in data)
 
     if has_predef and train_has and dev_has:
-        train = [s for s in data if s.split in ("train", "test")]
-        test = [s for s in data if s.split == "dev"]
+        train = [s for s in data if s.split in ("train")]
+        test = [s for s in data if s.split == ("dev", "test")]
         dev = []
         return train, dev, test
 

@@ -55,11 +55,17 @@ def _load_model(model_path: str, model_config: ModelConfig, device: torch.device
         use_aux_regression=model_config.use_aux_regression,
         aux_regression_weight=model_config.aux_regression_weight,
         aux_regression_loss=model_config.aux_regression_loss,
+        regression_decider_enabled=model_config.regression_decider_enabled,
+        regression_decider_margin=model_config.regression_decider_margin,
     )
 
     # Checkpoint stores state dict either at top level or under 'model_state_dict'
     state = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state)
+    load_result = model.load_state_dict(state, strict=False)
+    if load_result.missing_keys:
+        print(f"[WARN] Missing keys in checkpoint: {load_result.missing_keys}")
+    if load_result.unexpected_keys:
+        print(f"[WARN] Unexpected keys in checkpoint: {load_result.unexpected_keys}")
     model.to(device)
     model.eval()
     print("Model loaded successfully.")
@@ -190,16 +196,18 @@ def main():
     # --- predict ----------------------------------------------------------
     print("\nRunning model...")
     with torch.no_grad():
-        outputs  = model(input_ids=input_ids, attention_mask=attention_mask)
-        raw_preds = outputs["predictions"]   # dict dim -> Tensor[1]
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        raw_preds = outputs["predictions"]
+        reg_preds = outputs.get("regression_predictions")
 
     scores = {}
     for dim, pred in raw_preds.items():
         if model_config.use_regression:
             scores[dim] = float(pred.squeeze().cpu().item())
         else:
-            pred_class = torch.argmax(pred, dim=-1).item()
-            scores[dim] = float(pred_class + 1)
+            dim_reg = reg_preds[dim] if reg_preds is not None else None
+            pred_class = model.resolve_class_predictions(pred, dim_reg).item()
+            scores[dim] = float(pred_class)
 
     # --- output -----------------------------------------------------------
     if args.json:

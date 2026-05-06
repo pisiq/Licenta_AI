@@ -72,12 +72,14 @@ class MultiTaskOrdinalClassifier(nn.Module):
         score_dimensions: List[str],
         num_classes: int = 5,  # Kept for compatibility, not used in regression
         dropout: float = 0.1,
-        use_regression: bool = True,
-        use_aux_regression: bool = False,
+        use_regression: bool = False,
+        use_aux_regression: bool = True,
         aux_regression_weight: float = 0.0,
         aux_regression_loss: str = "huber",
         use_hierarchical: bool = False,
         chunk_size: int = 512,
+        regression_decider_enabled: bool = True,
+        regression_decider_margin: float = 0.15,
     ):
         super().__init__()
 
@@ -88,6 +90,8 @@ class MultiTaskOrdinalClassifier(nn.Module):
         self.aux_regression_weight = float(aux_regression_weight)
         self.aux_regression_loss = aux_regression_loss
         self.use_hierarchical = use_hierarchical
+        self.regression_decider_enabled = regression_decider_enabled
+        self.regression_decider_margin = float(regression_decider_margin)
 
         # Load pre-trained transformer
         self.config = AutoConfig.from_pretrained(base_model_name)
@@ -104,18 +108,48 @@ class MultiTaskOrdinalClassifier(nn.Module):
                 dim: RegressionHead(hidden_size, dropout)
                 for dim in score_dimensions
             })
+            self.regression_heads = None
         else:
             # Classification heads
             self.heads = nn.ModuleDict({
                 dim: ClassificationHead(hidden_size, num_classes, dropout)
                 for dim in score_dimensions
             })
+            # Optional regression heads to guide classification decisions
+            if self.use_aux_regression:
+                self.regression_heads = nn.ModuleDict({
+                    dim: RegressionHead(hidden_size, dropout)
+                    for dim in score_dimensions
+                })
+            else:
+                self.regression_heads = None
 
     def _expected_score(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute expected score in [1, num_classes] from class logits."""
         probs = torch.softmax(logits, dim=-1)
         idx = torch.arange(1, self.num_classes + 1, device=logits.device, dtype=probs.dtype)
         return torch.sum(probs * idx, dim=-1)
+
+    def resolve_class_predictions(
+        self,
+        logits: torch.Tensor,
+        regression_scores: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Resolve class predictions, optionally using regression to break close ties."""
+        top1 = torch.argmax(logits, dim=-1) + 1
+        if (not self.regression_decider_enabled) or (regression_scores is None):
+            return top1
+
+        probs = torch.softmax(logits, dim=-1)
+        top2_probs, top2_idx = torch.topk(probs, k=2, dim=-1)
+        margin_mask = (top2_probs[:, 0] - top2_probs[:, 1]) <= self.regression_decider_margin
+
+        reg = regression_scores.clamp(1.0, float(self.num_classes))
+        top2_scores = top2_idx + 1
+        dist = torch.abs(top2_scores.float() - reg.unsqueeze(-1))
+        reg_choice = top2_scores.gather(1, torch.argmin(dist, dim=-1).unsqueeze(-1)).squeeze(-1)
+
+        return torch.where(margin_mask, reg_choice, top2_scores[:, 0])
 
     def forward(
         self,
@@ -163,16 +197,25 @@ class MultiTaskOrdinalClassifier(nn.Module):
         for dim in self.score_dimensions:
             predictions[dim] = self.heads[dim](pooled_output)
 
+        regression_predictions = None
+        if self.regression_heads is not None:
+            regression_predictions = {
+                dim: self.regression_heads[dim](pooled_output)
+                for dim in self.score_dimensions
+            }
+
         output = {
             'predictions': predictions,
             'logits': predictions  # For backward compatibility
         }
+        if regression_predictions is not None:
+            output['regression_predictions'] = regression_predictions
 
         # Compute loss if labels provided
         if labels is not None:
             losses = {}
-            primary_loss   = None
-            aux_losses     = []
+            primary_loss = None
+            aux_losses = []
 
             if self.use_regression:
                 loss_fn = nn.HuberLoss(reduction='none', delta=1.0)
@@ -191,7 +234,7 @@ class MultiTaskOrdinalClassifier(nn.Module):
                     continue
 
                 dim_labels = labels[dim].float()
-                dim_preds  = predictions[dim]
+                dim_preds = predictions[dim]
 
                 # Skip samples with missing labels (-1 or NaN)
                 valid_mask = (dim_labels >= 0) & (~torch.isnan(dim_labels))
@@ -206,14 +249,19 @@ class MultiTaskOrdinalClassifier(nn.Module):
                     cls_weight = class_weights.get(dim) if class_weights else None
                     if cls_weight is not None:
                         cls_weight = cls_weight.to(dim_preds.device)
-                    ce_fn    = nn.CrossEntropyLoss(weight=cls_weight, reduction='none')
-                    ce_loss  = ce_fn(dim_preds[valid_mask], dim_labels_int[valid_mask]).mean()
+                    ce_fn = nn.CrossEntropyLoss(weight=cls_weight, reduction='none')
+                    ce_loss = ce_fn(dim_preds[valid_mask], dim_labels_int[valid_mask]).mean()
                     dim_loss = ce_loss
 
                     if reg_aux_fn is not None:
-                        expected = self._expected_score(dim_preds[valid_mask])
-                        reg_targets = dim_labels[valid_mask].clamp(1.0, float(self.num_classes))
-                        reg_loss = reg_aux_fn(expected, reg_targets).mean()
+                        if regression_predictions is not None:
+                            reg_preds = regression_predictions[dim]
+                            reg_targets = dim_labels[valid_mask].clamp(1.0, float(self.num_classes))
+                            reg_loss = reg_aux_fn(reg_preds[valid_mask], reg_targets).mean()
+                        else:
+                            expected = self._expected_score(dim_preds[valid_mask])
+                            reg_targets = dim_labels[valid_mask].clamp(1.0, float(self.num_classes))
+                            reg_loss = reg_aux_fn(expected, reg_targets).mean()
                         dim_loss = ce_loss + (self.aux_regression_weight * reg_loss)
 
                 losses[dim] = dim_loss
@@ -226,16 +274,16 @@ class MultiTaskOrdinalClassifier(nn.Module):
             # Combine: primary + weighted mean of auxiliaries
             if primary_loss is not None:
                 if aux_losses:
-                    aux_mean   = torch.stack(aux_losses).mean()
+                    aux_mean = torch.stack(aux_losses).mean()
                     total_loss = primary_loss + _AUXILIARY_WEIGHT * aux_mean
                 else:
                     total_loss = primary_loss
-                output['loss']          = total_loss
+                output['loss'] = total_loss
                 output['per_task_loss'] = losses
             elif aux_losses:
                 # Fallback: no primary label available in this batch
                 total_loss = torch.stack(aux_losses).mean()
-                output['loss']          = total_loss
+                output['loss'] = total_loss
                 output['per_task_loss'] = losses
 
         return output
@@ -261,6 +309,7 @@ class MultiTaskOrdinalClassifier(nn.Module):
 
             outputs = self.forward(input_ids, attention_mask)
             predictions = outputs['predictions']
+            regression_predictions = outputs.get('regression_predictions')
 
             scores = {}
             for dim, pred in predictions.items():
@@ -268,9 +317,9 @@ class MultiTaskOrdinalClassifier(nn.Module):
                     # Return continuous score
                     scores[dim] = pred.item()
                 else:
-                    # Classification mode - return class + 1
-                    pred_class = torch.argmax(pred, dim=-1).item()
-                    scores[dim] = pred_class + 1
+                    reg_pred = regression_predictions[dim] if regression_predictions is not None else None
+                    pred_class = self.resolve_class_predictions(pred, reg_pred).item()
+                    scores[dim] = pred_class
 
         return scores
 
@@ -387,3 +436,4 @@ class HierarchicalEncoder(nn.Module):
             return chunk_embeddings.max(dim=1)[0]
         else:
             raise ValueError(f"Unknown aggregation: {self.aggregation}")
+

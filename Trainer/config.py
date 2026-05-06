@@ -10,7 +10,7 @@ class ModelConfig:
     """Model architecture configuration."""
     # Base model
     base_model_name: str = "allenai/longformer-base-4096"
-    max_length: int = 2048
+    max_length: int = 4096
 
     # For hierarchical encoding if needed
     use_hierarchical: bool = True
@@ -18,8 +18,10 @@ class ModelConfig:
     use_aux_regression: bool = True  # Regression helps classification during training
     aux_regression_weight: float = 0.3  # Weight for auxiliary regression loss
     aux_regression_loss: str = "huber"  # "huber" or "mse"
+    regression_decider_enabled: bool = True  # Use regression to break close classification ties
+    regression_decider_margin: float = 0.15  # Prob margin for applying regression tie-break
     chunk_size: int = 512
-    chunk_overlap: int = 50
+    chunk_overlap: int = 128
 
     # Task dimensions
     score_dimensions: List[str] = None
@@ -31,17 +33,9 @@ class ModelConfig:
 
     def __post_init__(self):
         if self.score_dimensions is None:
-            # RECOMMENDATION is PRIMARY (index 0).
-            # The rest are auxiliary — masked out for ICLR samples.
+            # Train only the primary target.
             self.score_dimensions = [
-                "RECOMMENDATION",           # primary — all conferences
-                "IMPACT",                   # auxiliary — ACL/CoNLL only
-                "SUBSTANCE",                # auxiliary — ACL/CoNLL only
-                "APPROPRIATENESS",          # auxiliary — ACL/CoNLL only
-                "MEANINGFUL_COMPARISON",    # auxiliary — ACL/CoNLL only
-                "SOUNDNESS_CORRECTNESS",    # auxiliary — ACL/CoNLL only
-                "ORIGINALITY",              # auxiliary — ACL/CoNLL only
-                "CLARITY",                  # auxiliary — ACL/CoNLL only
+                "RECOMMENDATION",
             ]
 
 
@@ -57,10 +51,10 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
 
     # Training schedule
-    num_epochs: int = 20
+    num_epochs: int = 15
     train_batch_size: int = 2  # Small batch size for 8GB VRAM
     eval_batch_size: int = 4
-    gradient_accumulation_steps: int = 8  # Effective batch size = 1 * 8 = 8
+    gradient_accumulation_steps: int = 4  # Effective batch size = 1 * 8 = 8
 
     # Mixed precision for memory optimization
     fp16: bool = True  # Enable AMP (Automatic Mixed Precision)
@@ -80,7 +74,7 @@ class TrainingConfig:
     use_class_weights: bool = True  # Enable to handle class imbalance
 
     # Logging
-    logging_steps: int = 10  # More frequent logging
+    logging_steps: int = 25  # More frequent logging
     eval_steps: int = 500
     save_steps: int = 1  # Save every epoch
 
