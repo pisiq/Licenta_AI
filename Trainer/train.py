@@ -58,11 +58,29 @@ class _Tee:
 def _setup_run_dirs(training_config) -> tuple:
     """Create timestamped run directories and tee stdout/stderr to a log file.
 
+    Resolves relative output_dir / log_dir against the *project root* (parent
+    of the Trainer/ directory) so logs always land in the project regardless
+    of where the script is invoked from.
+
     Returns (run_output_dir, run_log_dir, log_file_handle).
     """
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _abspath(p: str) -> str:
+        if os.path.isabs(p):
+            return os.path.normpath(p)
+        # Strip any leading "../" — they were placeholders from the old CWD-relative defaults.
+        cleaned = p.replace("\\", "/").lstrip("./")
+        while cleaned.startswith("../"):
+            cleaned = cleaned[3:]
+        return os.path.normpath(os.path.join(project_root, cleaned))
+
+    base_output_dir = _abspath(training_config.output_dir)
+    base_log_dir    = _abspath(training_config.log_dir)
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_output_dir = os.path.join(training_config.output_dir, f"run_{timestamp}")
-    run_log_dir = os.path.join(training_config.log_dir, f"run_{timestamp}")
+    run_output_dir = os.path.join(base_output_dir, f"run_{timestamp}")
+    run_log_dir    = os.path.join(base_log_dir,    f"run_{timestamp}")
     os.makedirs(run_output_dir, exist_ok=True)
     os.makedirs(run_log_dir, exist_ok=True)
 
@@ -223,15 +241,27 @@ def main(args):
     # Compute class weights if enabled
     class_weights = None
     if training_config.use_class_weights:
-        print("\nComputing class weights for handling imbalance...")
-        class_weights = compute_class_weights(
-            train_dataset,
-            model_config.score_dimensions,
-            model_config.num_classes
-        )
-        print("Class weights computed:")
-        for dim, weights in class_weights.items():
-            print(f"  {dim}: {weights.numpy()}")
+        manual = getattr(training_config, 'manual_class_weights', None)
+        if manual is not None:
+            manual_t = torch.tensor(list(manual), dtype=torch.float32)
+            assert manual_t.numel() == model_config.num_classes, (
+                f"manual_class_weights length ({manual_t.numel()}) must equal "
+                f"num_classes ({model_config.num_classes})"
+            )
+            class_weights = {dim: manual_t.clone() for dim in model_config.score_dimensions}
+            print("\nUsing MANUAL class weights:")
+            for dim, weights in class_weights.items():
+                print(f"  {dim}: {weights.numpy()}")
+        else:
+            print("\nComputing class weights from inverse frequency...")
+            class_weights = compute_class_weights(
+                train_dataset,
+                model_config.score_dimensions,
+                model_config.num_classes
+            )
+            print("Class weights computed:")
+            for dim, weights in class_weights.items():
+                print(f"  {dim}: {weights.numpy()}")
 
     # Create data loaders
     # num_workers=0 on Windows (avoids multiprocessing spawn issues)
@@ -287,11 +317,13 @@ def main(args):
         chunk_size=model_config.chunk_size,
         regression_decider_enabled=model_config.regression_decider_enabled,
         regression_decider_margin=model_config.regression_decider_margin,
+        regression_strong_override_distance=getattr(model_config, 'regression_strong_override_distance', 0.0),
         use_focal_loss=getattr(training_config, 'use_focal_loss', False),
         focal_gamma=getattr(training_config, 'focal_gamma', 2.0),
         use_ordinal_smoothing=getattr(training_config, 'use_ordinal_smoothing', False),
         ordinal_smoothing=getattr(training_config, 'ordinal_smoothing', 0.1),
         ordinal_smoothing_temperature=getattr(training_config, 'ordinal_smoothing_temperature', 1.0),
+        gradient_checkpointing=getattr(model_config, 'gradient_checkpointing', False),
     )
 
     model.to(device)

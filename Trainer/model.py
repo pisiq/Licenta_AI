@@ -133,11 +133,13 @@ class MultiTaskOrdinalClassifier(nn.Module):
         chunk_size: int = 512,
         regression_decider_enabled: bool = True,
         regression_decider_margin: float = 0.15,
+        regression_strong_override_distance: float = 0.0,
         use_focal_loss: bool = False,
         focal_gamma: float = 2.0,
         use_ordinal_smoothing: bool = False,
         ordinal_smoothing: float = 0.1,
         ordinal_smoothing_temperature: float = 1.0,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
 
@@ -150,6 +152,7 @@ class MultiTaskOrdinalClassifier(nn.Module):
         self.use_hierarchical = use_hierarchical
         self.regression_decider_enabled = regression_decider_enabled
         self.regression_decider_margin = float(regression_decider_margin)
+        self.regression_strong_override_distance = float(regression_strong_override_distance)
         self.use_focal_loss = use_focal_loss
         self.focal_gamma = float(focal_gamma)
         self.use_ordinal_smoothing = use_ordinal_smoothing
@@ -162,6 +165,15 @@ class MultiTaskOrdinalClassifier(nn.Module):
             self.encoder = HierarchicalEncoder(base_model_name, chunk_size=chunk_size)
         else:
             self.encoder = AutoModel.from_pretrained(base_model_name, config=self.config)
+
+        # Optional gradient checkpointing on the underlying transformer (saves VRAM)
+        if gradient_checkpointing:
+            inner = getattr(self.encoder, 'encoder', self.encoder)
+            if hasattr(inner, 'gradient_checkpointing_enable'):
+                inner.gradient_checkpointing_enable()
+                if hasattr(inner, 'config'):
+                    inner.config.use_cache = False
+                print("[OK] Gradient checkpointing enabled")
 
         hidden_size = self.config.hidden_size
 
@@ -198,21 +210,36 @@ class MultiTaskOrdinalClassifier(nn.Module):
         logits: torch.Tensor,
         regression_scores: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Resolve class predictions, optionally using regression to break close ties."""
+        """Resolve class predictions, using regression to break ties and to
+        override classification on strong disagreements."""
         top1 = torch.argmax(logits, dim=-1) + 1
         if (not self.regression_decider_enabled) or (regression_scores is None):
             return top1
 
+        reg = regression_scores.clamp(1.0, float(self.num_classes))
+
+        # Stage 1 — strong-override: if regression disagrees with top-1 by more
+        # than `regression_strong_override_distance`, trust the regression's
+        # rounded value (clamped to valid class range).
+        out = top1.clone()
+        strong_dist = self.regression_strong_override_distance
+        if strong_dist > 0:
+            reg_class_full = torch.round(reg).clamp(1, self.num_classes).long()
+            strong_mask = torch.abs(reg - top1.float()) >= strong_dist
+            out = torch.where(strong_mask, reg_class_full, out)
+
+        # Stage 2 — close-tie tie-break between top-1 and top-2.
         probs = torch.softmax(logits, dim=-1)
         top2_probs, top2_idx = torch.topk(probs, k=2, dim=-1)
         margin_mask = (top2_probs[:, 0] - top2_probs[:, 1]) <= self.regression_decider_margin
-
-        reg = regression_scores.clamp(1.0, float(self.num_classes))
         top2_scores = top2_idx + 1
         dist = torch.abs(top2_scores.float() - reg.unsqueeze(-1))
         reg_choice = top2_scores.gather(1, torch.argmin(dist, dim=-1).unsqueeze(-1)).squeeze(-1)
 
-        return torch.where(margin_mask, reg_choice, top2_scores[:, 0])
+        # Apply tie-break only where the strong override didn't already fire.
+        not_overridden = (out == top1)
+        out = torch.where(margin_mask & not_overridden, reg_choice, out)
+        return out
 
     def forward(
         self,

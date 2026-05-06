@@ -8,20 +8,26 @@ from typing import List
 @dataclass
 class ModelConfig:
     """Model architecture configuration."""
-    # Base model
-    base_model_name: str = "allenai/longformer-base-4096"
-    max_length: int = 4096
+    # Base model — SciBERT (domain-matched, 110M params, 512-token native window)
+    base_model_name: str = "allenai/scibert_scivocab_uncased"
+    max_length: int = 2048
 
-    # For hierarchical encoding if needed
+    # Hierarchical encoding (process long papers as 512-token chunks)
     use_hierarchical: bool = True
     use_regression: bool = False  # Classification is primary output
     use_aux_regression: bool = True  # Regression helps classification during training
-    aux_regression_weight: float = 0.3  # Weight for auxiliary regression loss
+    aux_regression_weight: float = 0.5  # Stronger signal -> better tie-breaker (was 0.3)
     aux_regression_loss: str = "huber"  # "huber" or "mse"
     regression_decider_enabled: bool = True  # Use regression to break close classification ties
-    regression_decider_margin: float = 0.15  # Prob margin for applying regression tie-break
+    regression_decider_margin: float = 0.30  # Wider margin -> regression votes more often
+    # If |regression - top1| >= this, trust the regression's rounded value
+    # (overrides classification entirely on strong disagreements). 0 = disabled.
+    regression_strong_override_distance: float = 1.5
     chunk_size: int = 512
-    chunk_overlap: int = 128
+    chunk_overlap: int = 64        # Reduced from 128 to save memory
+
+    # Memory optimization
+    gradient_checkpointing: bool = True  # Trade ~25% speed for ~30-40% less VRAM
 
     # Task dimensions
     score_dimensions: List[str] = None
@@ -72,19 +78,28 @@ class TrainingConfig:
 
     # Class weights (only used in classification mode)
     use_class_weights: bool = True  # Enable to handle class imbalance
+    # Manual per-class weights (length = num_classes). When set, OVERRIDES the
+    # inverse-frequency formula. Indices = class 0..4 (= scores 1..5).
+    # Very mild bias: small nudge for class 0 and 3 so they aren't ignored,
+    # but classes 1 and 2 (the bulk of the data) still own the loss surface.
+    manual_class_weights: tuple = (1.5, 1.0, 1.0, 1.2, 1.0)
 
-    # Focal loss (replaces weighted CE when enabled)
-    use_focal_loss: bool = True
-    focal_gamma: float = 2.0  # Focusing parameter; >0 down-weights easy examples
+    # Focal loss DISABLED — it down-weights the easy majority classes (1 and 2),
+    # which combined with class weights pushes the model into the extremes.
+    # Re-enable later (with γ ≤ 0.5) once class weights alone are balanced.
+    use_focal_loss: bool = False
+    focal_gamma: float = 0.0
 
     # Ordinal label smoothing (Laplace-style soft labels around the true class)
     use_ordinal_smoothing: bool = True
     ordinal_smoothing: float = 0.1   # Mass moved from one-hot to neighbor distribution
     ordinal_smoothing_temperature: float = 1.0  # Sharpness of neighbor distribution
 
-    # Weighted random sampling for minority classes (RECOMMENDATION dim)
-    use_weighted_sampler: bool = True
-    sampler_minority_boost: float = 1.5  # Extra multiplier for classes 0 and 3
+    # Weighted random sampling for minority classes — DISABLED.
+    # Stacking it on top of class weights + focal loss caused the model to
+    # collapse onto the boosted classes. Keep one mechanism, not three.
+    use_weighted_sampler: bool = False
+    sampler_minority_boost: float = 1.0
 
     # Logging
     logging_steps: int = 25  # More frequent logging
@@ -104,9 +119,9 @@ class DataConfig:
     """Data processing configuration."""
     # Data paths
     data_path: str = "./data/papers_reviews.json"
-    train_split: float = 0.8
+    train_split: float = 0.75
     dev_split: float = 0.0
-    test_split: float = 0.2
+    test_split: float = 0.25
 
     # Preprocessing
     max_paper_length: int = 10000  # characters before tokenization
