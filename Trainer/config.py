@@ -2,7 +2,7 @@
 Configuration file for the multi-task ordinal classification pipeline.
 """
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -14,6 +14,23 @@ class ModelConfig:
 
     # Hierarchical encoding (process long papers as 512-token chunks)
     use_hierarchical: bool = True
+    chunk_aggregation: str = "attention"  # "attention" | "mean" | "max"
+
+    # Output head type for the primary classification target.
+    #   "softmax" : K-way softmax classifier
+    #   "corn"    : ordinal CORN head with K-1 binary outputs (recommended for ordinal targets)
+    head_type: str = "corn"
+
+    # CORN per-head thresholds will default to 0.5 everywhere unless overridden;
+    # the field below is a 5-class default kept for back-compat. When K != 5
+    # the model auto-fills 0.5 for every binary head if this is the wrong length.
+    # Per-binary-head thresholds for CORN at inference. Length = K-1.
+    # Each head k decides whether y > k. Predicted class = 1 + #heads firing.
+    #   thresholds[0] HIGHER  -> head 0 fires less   -> predict score 1 MORE
+    #   thresholds[0] LOWER   -> head 0 fires more   -> predict score 1 LESS
+    # To rescue class 0 (score 1), raise thresholds[0] to e.g. 0.65–0.75.
+    # Defaults to 0.5 everywhere = standard CORN decoding.
+    corn_thresholds: Optional[tuple] = None
     use_regression: bool = False  # Classification is primary output
     use_aux_regression: bool = True  # Regression helps classification during training
     aux_regression_weight: float = 0.5  # Stronger signal -> better tie-breaker (was 0.3)
@@ -31,7 +48,7 @@ class ModelConfig:
 
     # Task dimensions
     score_dimensions: List[str] = None
-    num_classes: int = 5  # Scores from 1 to 5 (classification outputs 0-4)
+    num_classes: int = 10  # Native ICLR scale 1..10 (classification outputs 0..9)
 
     # Model architecture
     hidden_dropout_prob: float = 0.1
@@ -78,11 +95,22 @@ class TrainingConfig:
 
     # Class weights (only used in classification mode)
     use_class_weights: bool = True  # Enable to handle class imbalance
-    # Manual per-class weights (length = num_classes). When set, OVERRIDES the
-    # inverse-frequency formula. Indices = class 0..4 (= scores 1..5).
-    # Very mild bias: small nudge for class 0 and 3 so they aren't ignored,
-    # but classes 1 and 2 (the bulk of the data) still own the loss surface.
-    manual_class_weights: tuple = (1.5, 1.0, 1.0, 1.2, 1.0)
+    # Strategy for computing class weights:
+    #   "sqrt_inverse_freq" : weight_c ∝ 1/sqrt(count_c)   (mild, recommended)
+    #   "inverse_freq"      : weight_c ∝ 1/count_c         (aggressive, can collapse)
+    #   "manual"            : use `manual_class_weights` directly
+    class_weight_mode: str = "sqrt_inverse_freq"
+    # Optional manual override (only used when class_weight_mode == "manual").
+    # If set, length must equal num_classes.
+    manual_class_weights: Optional[tuple] = None
+    # Extra per-class multiplier applied AFTER the chosen mode. None = uniform.
+    # If set, length must equal num_classes.
+    class_weight_post_boost: Optional[tuple] = None
+
+    # Confidence-weighted training: multiply each per-reviewer training sample's
+    # loss by `confidence / max_confidence` (range ~0.2..1.0). Falls back to 1.0
+    # when no confidence is available. Only meaningful with expand_per_reviewer=True.
+    use_confidence_weighting: bool = True
 
     # Focal loss DISABLED — it down-weights the easy majority classes (1 and 2),
     # which combined with class weights pushes the model into the extremes.
@@ -132,4 +160,22 @@ class DataConfig:
     # Label processing
     aggregation_method: str = "mean_round"  # mean then round to nearest int
     min_label: int = 1
-    max_label: int = 5
+    max_label: int = 10
+    # Target label scale: 5 (PeerRead-normalized) or 10 (native ICLR ratings).
+    # Must equal model_config.num_classes for the loss/metric math to align.
+    score_scale: int = 10
+    # When True, restrict load_peerread_data to ICLR conferences only (drops
+    # ACL/CoNLL since those don't carry confidence). When False, all configured
+    # conferences are loaded.
+    iclr_only: bool = True
+
+    # If True, expand each TRAINING paper into N samples — one per reviewer's
+    # individual score on the primary dimension (RECOMMENDATION). Test set is
+    # never expanded; it stays at one mean-aggregated label per paper.
+    expand_per_reviewer: bool = True
+
+    # Optional per-class cap for the TRAINING set (after per-reviewer expansion).
+    # If set, classes with more than this many samples are randomly subsampled
+    # down to this count; rare classes (count <= cap) are kept as-is. None = off.
+    # Suggested starting value: 2700 (matches the natural class-3 count).
+    train_class_cap: Optional[int] = None

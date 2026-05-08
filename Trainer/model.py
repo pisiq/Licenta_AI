@@ -27,6 +27,65 @@ def ordinal_soft_labels(
     return (1.0 - smoothing) * one_hot + smoothing * neighbor
 
 
+def corn_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    num_classes: int,
+    sample_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """CORN ordinal loss with optional per-sample weights.
+
+    `logits`         : [B, K-1] — head outputs P(y > k) for k = 0..K-2
+    `targets`        : [B]      — long, 0..K-1
+    `sample_weights` : [B]      — optional, multiplies each sample's BCE term.
+
+    Each binary head k trains on the subset of samples whose target >= k.
+    """
+    K = num_classes
+    losses = []
+    weight_sum = 0.0
+    for k in range(K - 1):
+        mask = targets >= k                             # [B]
+        if mask.sum() == 0:
+            continue
+        sub_logits  = logits[mask, k]                   # [n_k]
+        sub_targets = (targets[mask] > k).float()       # [n_k] (0 or 1)
+        # Per-element BCE so we can weight individually.
+        bce = F.binary_cross_entropy_with_logits(
+            sub_logits, sub_targets, reduction='none'
+        )                                               # [n_k]
+        if sample_weights is not None:
+            w = sample_weights[mask]
+            bce = bce * w
+            weight_sum += float(w.sum().item())
+        else:
+            weight_sum += float(mask.sum().item())
+        losses.append(bce.sum())
+
+    if not losses or weight_sum <= 0:
+        return logits.new_zeros(())
+    return torch.stack(losses).sum() / weight_sum
+
+
+def corn_logits_to_class(
+    logits: torch.Tensor,
+    thresholds: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Decode CORN [B, K-1] logits to predicted class index in [1, K].
+
+    `thresholds` (optional, shape [K-1]) lets each binary head fire at a
+    custom probability threshold. Lowering thresholds[0] biases toward
+    predicting class 0 less often (i.e., predicting class 1+ more often);
+    raising it biases the other way. Default 0.5 everywhere.
+    """
+    probs = torch.sigmoid(logits)                       # [B, K-1]
+    if thresholds is None:
+        return 1 + (probs > 0.5).long().sum(dim=-1)
+    th = thresholds.to(probs.device).view(1, -1)        # [1, K-1]
+    return 1 + (probs > th).long().sum(dim=-1)
+
+
 def focal_ce_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -36,10 +95,10 @@ def focal_ce_loss(
     gamma: float = 2.0,
     smoothing: float = 0.0,
     smoothing_temperature: float = 1.0,
+    sample_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Focal cross-entropy with optional ordinal label smoothing and class weights.
-
-    Reduces to weighted CE when gamma=0 and smoothing=0.
+    """Focal cross-entropy with optional ordinal label smoothing, class weights,
+    and per-sample weights. Reduces to weighted CE when gamma=0 and smoothing=0.
     """
     log_probs = F.log_softmax(logits, dim=-1)
     probs = log_probs.exp()
@@ -57,6 +116,10 @@ def focal_ce_loss(
     loss = focal_weight * ce_per_sample
     if alpha is not None:
         loss = loss * alpha[targets]
+    if sample_weights is not None:
+        loss = loss * sample_weights
+        denom = sample_weights.sum().clamp(min=1e-8)
+        return loss.sum() / denom
     return loss.mean()
 
 # Per-dimension loss weights:
@@ -68,26 +131,19 @@ _AUXILIARY_WEIGHT      = 0.3   # How much the 7 aux dimensions contribute vs. RE
 
 
 class RegressionHead(nn.Module):
-    """Regression head for a single score dimension - outputs continuous score in [1, 5]."""
+    """Regression head outputs continuous score in [1, num_classes]."""
 
-    def __init__(self, hidden_size: int, dropout: float = 0.1):
+    def __init__(self, hidden_size: int, dropout: float = 0.1, num_classes: int = 5):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
         self.regressor = nn.Linear(hidden_size, 1)
-        # Sigmoid + scaling to map output to [1, 5] range
+        self.num_classes = int(num_classes)
 
     def forward(self, pooled_output: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            pooled_output: [batch_size, hidden_size]
-        Returns:
-            scores: [batch_size, 1] - continuous scores in range [1, 5]
-        """
         x = self.dropout(pooled_output)
-        # Raw output
         raw_score = self.regressor(x)
-        # Map to [1, 5] using sigmoid: 1 + 4 * sigmoid(x)
-        score = 1.0 + 4.0 * torch.sigmoid(raw_score)
+        # Map to [1, num_classes] using sigmoid: 1 + (K-1) * sigmoid(x)
+        score = 1.0 + float(self.num_classes - 1) * torch.sigmoid(raw_score)
         return score.squeeze(-1)  # [batch_size]
 
 
@@ -109,6 +165,25 @@ class ClassificationHead(nn.Module):
         x = self.dropout(pooled_output)
         logits = self.classifier(x)
         return logits
+
+
+class OrdinalCORNHead(nn.Module):
+    """K-1 binary outputs for CORN ordinal regression.
+
+    Each output k corresponds to P(y > k). At inference, the predicted class
+    index is 1 + sum_k 1[sigmoid(logit_k) > 0.5].
+    """
+
+    def __init__(self, hidden_size: int, num_classes: int = 5, dropout: float = 0.1):
+        super().__init__()
+        assert num_classes >= 2, "CORN head needs at least 2 classes"
+        self.num_classes = num_classes
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_size, num_classes - 1)
+
+    def forward(self, pooled_output: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(pooled_output)
+        return self.classifier(x)  # [B, K-1]
 
 
 class MultiTaskOrdinalClassifier(nn.Module):
@@ -140,6 +215,9 @@ class MultiTaskOrdinalClassifier(nn.Module):
         ordinal_smoothing: float = 0.1,
         ordinal_smoothing_temperature: float = 1.0,
         gradient_checkpointing: bool = False,
+        chunk_aggregation: str = "attention",
+        head_type: str = "softmax",
+        corn_thresholds: Optional[List[float]] = None,
     ):
         super().__init__()
 
@@ -158,11 +236,29 @@ class MultiTaskOrdinalClassifier(nn.Module):
         self.use_ordinal_smoothing = use_ordinal_smoothing
         self.ordinal_smoothing = float(ordinal_smoothing)
         self.ordinal_smoothing_temperature = float(ordinal_smoothing_temperature)
+        self.head_type = head_type
+        self.chunk_aggregation = chunk_aggregation
+        # Buffer (not parameter): per-binary-head thresholds for CORN.
+        if corn_thresholds is not None:
+            assert len(corn_thresholds) == num_classes - 1, (
+                f"corn_thresholds must have length num_classes-1 = {num_classes-1}"
+            )
+            self.register_buffer(
+                'corn_thresholds_buf',
+                torch.tensor(list(corn_thresholds), dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.corn_thresholds_buf = None
 
         # Load pre-trained transformer
         self.config = AutoConfig.from_pretrained(base_model_name)
         if self.use_hierarchical:
-            self.encoder = HierarchicalEncoder(base_model_name, chunk_size=chunk_size)
+            self.encoder = HierarchicalEncoder(
+                base_model_name,
+                chunk_size=chunk_size,
+                aggregation=chunk_aggregation,
+            )
         else:
             self.encoder = AutoModel.from_pretrained(base_model_name, config=self.config)
 
@@ -180,20 +276,28 @@ class MultiTaskOrdinalClassifier(nn.Module):
         # Create regression heads for each dimension
         if use_regression:
             self.heads = nn.ModuleDict({
-                dim: RegressionHead(hidden_size, dropout)
+                dim: RegressionHead(hidden_size, dropout, num_classes=num_classes)
                 for dim in score_dimensions
             })
             self.regression_heads = None
         else:
-            # Classification heads
-            self.heads = nn.ModuleDict({
-                dim: ClassificationHead(hidden_size, num_classes, dropout)
-                for dim in score_dimensions
-            })
+            # Classification heads — softmax (default) or CORN ordinal
+            if self.head_type == "corn":
+                self.heads = nn.ModuleDict({
+                    dim: OrdinalCORNHead(hidden_size, num_classes, dropout)
+                    for dim in score_dimensions
+                })
+            elif self.head_type == "softmax":
+                self.heads = nn.ModuleDict({
+                    dim: ClassificationHead(hidden_size, num_classes, dropout)
+                    for dim in score_dimensions
+                })
+            else:
+                raise ValueError(f"Unknown head_type: {self.head_type!r}")
             # Optional regression heads to guide classification decisions
             if self.use_aux_regression:
                 self.regression_heads = nn.ModuleDict({
-                    dim: RegressionHead(hidden_size, dropout)
+                    dim: RegressionHead(hidden_size, dropout, num_classes=num_classes)
                     for dim in score_dimensions
                 })
             else:
@@ -211,7 +315,29 @@ class MultiTaskOrdinalClassifier(nn.Module):
         regression_scores: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Resolve class predictions, using regression to break ties and to
-        override classification on strong disagreements."""
+        override classification on strong disagreements.
+
+        Handles both:
+          - Softmax logits  : shape [B, K]      (top-1 = argmax + 1)
+          - CORN logits     : shape [B, K-1]    (class = 1 + sum sigmoid > 0.5)
+        """
+        if logits.size(-1) == self.num_classes - 1:
+            # CORN head — top-1 from monotone binary outputs (with optional
+            # per-head thresholds for calibration).
+            top1 = corn_logits_to_class(logits, thresholds=self.corn_thresholds_buf)
+            # The top-2 / softmax tie-break logic doesn't apply to CORN, but
+            # the strong-override (regression vs top-1) still does.
+            if (not self.regression_decider_enabled) or (regression_scores is None):
+                return top1
+            reg = regression_scores.clamp(1.0, float(self.num_classes))
+            out = top1.clone()
+            strong_dist = self.regression_strong_override_distance
+            if strong_dist > 0:
+                reg_class_full = torch.round(reg).clamp(1, self.num_classes).long()
+                strong_mask = torch.abs(reg - top1.float()) >= strong_dist
+                out = torch.where(strong_mask, reg_class_full, out)
+            return out
+
         top1 = torch.argmax(logits, dim=-1) + 1
         if (not self.regression_decider_enabled) or (regression_scores is None):
             return top1
@@ -246,7 +372,8 @@ class MultiTaskOrdinalClassifier(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: Optional[Dict[str, torch.Tensor]] = None,
-        class_weights: Optional[Dict[str, torch.Tensor]] = None
+        class_weights: Optional[Dict[str, torch.Tensor]] = None,
+        sample_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
@@ -332,36 +459,58 @@ class MultiTaskOrdinalClassifier(nn.Module):
                 if valid_mask.sum() == 0:
                     continue
 
+                # Per-sample weights (e.g. reviewer confidence). May be None.
+                sw = None
+                if sample_weights is not None:
+                    sw = sample_weights[valid_mask].to(dim_preds.device)
+
                 if self.use_regression:
-                    dim_loss = loss_fn(dim_preds[valid_mask], dim_labels[valid_mask]).mean()
+                    per = loss_fn(dim_preds[valid_mask], dim_labels[valid_mask])
+                    if sw is not None:
+                        dim_loss = (per * sw).sum() / sw.sum().clamp(min=1e-8)
+                    else:
+                        dim_loss = per.mean()
                 else:
                     dim_labels_int = torch.round(dim_labels).clamp(1, self.num_classes).long() - 1
-                    cls_weight = class_weights.get(dim) if class_weights else None
-                    if cls_weight is not None:
-                        cls_weight = cls_weight.to(dim_preds.device)
 
-                    gamma = self.focal_gamma if self.use_focal_loss else 0.0
-                    smoothing = self.ordinal_smoothing if self.use_ordinal_smoothing else 0.0
-                    ce_loss = focal_ce_loss(
-                        dim_preds[valid_mask],
-                        dim_labels_int[valid_mask],
-                        num_classes=self.num_classes,
-                        alpha=cls_weight,
-                        gamma=gamma,
-                        smoothing=smoothing,
-                        smoothing_temperature=self.ordinal_smoothing_temperature,
-                    )
+                    if self.head_type == "corn":
+                        # CORN ordinal loss; class weights are intentionally
+                        # ignored — the ordinal structure handles imbalance.
+                        ce_loss = corn_loss(
+                            dim_preds[valid_mask],
+                            dim_labels_int[valid_mask],
+                            num_classes=self.num_classes,
+                            sample_weights=sw,
+                        )
+                    else:
+                        cls_weight = class_weights.get(dim) if class_weights else None
+                        if cls_weight is not None:
+                            cls_weight = cls_weight.to(dim_preds.device)
+
+                        gamma = self.focal_gamma if self.use_focal_loss else 0.0
+                        smoothing = self.ordinal_smoothing if self.use_ordinal_smoothing else 0.0
+                        ce_loss = focal_ce_loss(
+                            dim_preds[valid_mask],
+                            dim_labels_int[valid_mask],
+                            num_classes=self.num_classes,
+                            alpha=cls_weight,
+                            gamma=gamma,
+                            smoothing=smoothing,
+                            smoothing_temperature=self.ordinal_smoothing_temperature,
+                            sample_weights=sw,
+                        )
+
                     dim_loss = ce_loss
 
-                    if reg_aux_fn is not None:
-                        if regression_predictions is not None:
-                            reg_preds = regression_predictions[dim]
-                            reg_targets = dim_labels[valid_mask].clamp(1.0, float(self.num_classes))
-                            reg_loss = reg_aux_fn(reg_preds[valid_mask], reg_targets).mean()
+                    # Aux regression — applies for both softmax and CORN heads.
+                    if reg_aux_fn is not None and regression_predictions is not None:
+                        reg_preds = regression_predictions[dim]
+                        reg_targets = dim_labels[valid_mask].clamp(1.0, float(self.num_classes))
+                        reg_per = reg_aux_fn(reg_preds[valid_mask], reg_targets)
+                        if sw is not None:
+                            reg_loss = (reg_per * sw).sum() / sw.sum().clamp(min=1e-8)
                         else:
-                            expected = self._expected_score(dim_preds[valid_mask])
-                            reg_targets = dim_labels[valid_mask].clamp(1.0, float(self.num_classes))
-                            reg_loss = reg_aux_fn(expected, reg_targets).mean()
+                            reg_loss = reg_per.mean()
                         dim_loss = ce_loss + (self.aux_regression_weight * reg_loss)
 
                 losses[dim] = dim_loss
@@ -472,7 +621,7 @@ class HierarchicalEncoder(nn.Module):
         self,
         base_model_name: str,
         chunk_size: int = 512,
-        aggregation: str = 'mean'
+        aggregation: str = 'attention'
     ):
         super().__init__()
 
@@ -482,6 +631,15 @@ class HierarchicalEncoder(nn.Module):
         # Load pre-trained transformer
         self.config = AutoConfig.from_pretrained(base_model_name)
         self.encoder = AutoModel.from_pretrained(base_model_name, config=self.config)
+
+        # Lightweight per-chunk attention pooling head (used when aggregation='attention').
+        # Runs ALWAYS in fp32 to keep softmax numerics stable under AMP.
+        if self.aggregation == 'attention':
+            self.chunk_attention = nn.Linear(self.config.hidden_size, 1)
+        else:
+            self.chunk_attention = None
+        # Buffer to expose last attention weights for diagnostics (set during forward).
+        self.last_attention_weights: Optional[torch.Tensor] = None
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -528,12 +686,18 @@ class HierarchicalEncoder(nn.Module):
             chunk_embeddings.append(chunk_emb)
 
         # Aggregate chunk embeddings
-        chunk_embeddings = torch.stack(chunk_embeddings, dim=1)  # [batch_size, num_chunks, hidden_size]
+        chunk_embeddings = torch.stack(chunk_embeddings, dim=1)  # [B, num_chunks, H]
 
         if self.aggregation == 'mean':
             return chunk_embeddings.mean(dim=1)
         elif self.aggregation == 'max':
             return chunk_embeddings.max(dim=1)[0]
+        elif self.aggregation == 'attention':
+            # Score per chunk -> softmax weights -> weighted sum
+            scores = self.chunk_attention(chunk_embeddings).squeeze(-1)   # [B, num_chunks]
+            weights = torch.softmax(scores, dim=-1)                        # [B, num_chunks]
+            self.last_attention_weights = weights.detach()
+            return (chunk_embeddings * weights.unsqueeze(-1)).sum(dim=1)   # [B, H]
         else:
             raise ValueError(f"Unknown aggregation: {self.aggregation}")
 

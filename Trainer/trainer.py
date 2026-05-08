@@ -4,7 +4,7 @@ Training utilities and trainer class.
 import os
 import torch
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence  # noqa: F401
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
@@ -22,47 +22,91 @@ def set_seed(seed: int):
     np.random.seed(seed)
 
 
-def compute_class_weights(
+def count_classes(
     dataset,
     score_dimensions: List[str],
-    num_classes: int = 5
-) -> Dict[str, torch.Tensor]:
-    """
-    Compute class weights for handling class imbalance.
-
-    Args:
-        dataset: PyTorch Dataset
-        score_dimensions: List of score dimension names
-        num_classes: Number of classes
-
-    Returns:
-        Dictionary of {dimension: weight tensor [num_classes]}
-    """
-    # Count class occurrences
-    class_counts = {dim: np.zeros(num_classes) for dim in score_dimensions}
-
+    num_classes: int = 5,
+) -> Dict[str, np.ndarray]:
+    """Count per-class occurrences across the dataset (skipping NaN/missing)."""
+    class_counts = {dim: np.zeros(num_classes, dtype=np.int64) for dim in score_dimensions}
     for i in range(len(dataset)):
         sample = dataset[i]
         for dim in score_dimensions:
-            if dim in sample['labels']:
-                label = sample['labels'][dim]
-                if label >= 0:  # Valid label
-                    label_int = int(np.clip(np.round(float(label)), 1, num_classes)) - 1
-                    class_counts[dim][label_int] += 1
+            if dim not in sample['labels']:
+                continue
+            label = float(sample['labels'][dim])
+            if np.isnan(label) or label < 1:
+                continue
+            label_int = int(np.clip(np.round(label), 1, num_classes)) - 1
+            class_counts[dim][label_int] += 1
+    return class_counts
 
-    # Compute weights (inverse frequency)
+
+def print_class_distribution(
+    counts: Dict[str, np.ndarray],
+    num_classes: int = 5,
+    title: str = "Class distribution",
+) -> None:
+    """Pretty-print per-class counts and percentages for each dimension."""
+    print(f"\n[{title}]")
+    for dim, c in counts.items():
+        total = int(c.sum())
+        if total == 0:
+            print(f"  {dim}: (no labeled samples)")
+            continue
+        pct = (c / total) * 100.0
+        cells = [f"{i+1}: {int(c[i])} ({pct[i]:.1f}%)" for i in range(num_classes)]
+        print(f"  {dim} [n={total}]  " + "  |  ".join(cells))
+
+
+def compute_class_weights(
+    dataset,
+    score_dimensions: List[str],
+    num_classes: int = 5,
+    mode: str = "sqrt_inverse_freq",
+    post_boost: Optional[List[float]] = None,
+    counts: Optional[Dict[str, np.ndarray]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Compute class weights for handling class imbalance.
+
+    mode:
+      - "sqrt_inverse_freq" : weight ∝ 1/sqrt(count)
+      - "inverse_freq"      : weight ∝ 1/count
+    post_boost : optional length-num_classes multiplier applied AFTER the
+                 chosen formula (e.g. (1.0, 1.0, 1.0, 1.1, 1.0)).
+    counts     : if pre-computed (via count_classes), reuses them and skips
+                 the second iteration over the dataset.
+    """
+    if counts is None:
+        counts = count_classes(dataset, score_dimensions, num_classes)
+
+    if post_boost is None:
+        boost = np.ones(num_classes, dtype=np.float64)
+    else:
+        boost = np.asarray(post_boost, dtype=np.float64)
+        assert boost.shape == (num_classes,), "post_boost must have length num_classes"
+
     class_weights = {}
     for dim in score_dimensions:
-        counts = class_counts[dim]
-        # Avoid division by zero
-        counts = np.maximum(counts, 1)
+        raw = counts[dim].astype(np.float64)
+        present = raw > 0
+        w = np.zeros(num_classes, dtype=np.float64)
 
-        # Inverse frequency
-        weights = 1.0 / counts
-        # Normalize
-        weights = weights / weights.sum() * num_classes
+        # Compute only for present classes; absent classes stay at 0 so the
+        # loss never punishes/rewards predicting them.
+        if mode == "inverse_freq":
+            w[present] = 1.0 / raw[present]
+        elif mode == "sqrt_inverse_freq":
+            w[present] = 1.0 / np.sqrt(raw[present])
+        else:
+            raise ValueError(f"Unknown class_weight_mode: {mode!r}")
 
-        class_weights[dim] = torch.FloatTensor(weights)
+        w = w * boost
+        # Normalize so the mean weight over PRESENT classes = 1.
+        present_mean = w[present].mean() if present.any() else 1.0
+        if present_mean > 0:
+            w = w / present_mean
+        class_weights[dim] = torch.FloatTensor(w)
 
     return class_weights
 
@@ -211,6 +255,11 @@ class Trainer:
                 for dim in self.model.score_dimensions
             } if 'label_mask' in batch else None
 
+            # Optional per-sample confidence weights
+            sample_weights = None
+            if getattr(self.config, 'use_confidence_weighting', False) and 'confidence_weight' in batch:
+                sample_weights = batch['confidence_weight'].to(self.device)
+
             # Forward pass with AMP
             if self.use_amp:
                 with autocast(device_type="cuda"):
@@ -218,7 +267,8 @@ class Trainer:
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         labels=labels,
-                        class_weights=self.class_weights
+                        class_weights=self.class_weights,
+                        sample_weights=sample_weights,
                     )
                     loss = outputs['loss']
 
@@ -336,6 +386,7 @@ class Trainer:
                         preds = pred_classes.cpu().numpy()
                         labels_valid = np.clip(np.round(dim_labels), 1, self.model.num_classes)
 
+
                     # Only keep samples with a valid (non-NaN, >= 1) label
                     valid_mask = (~np.isnan(dim_labels)) & (dim_labels >= 1)
                     all_predictions[dim].extend(preds[valid_mask])
@@ -350,7 +401,8 @@ class Trainer:
             all_predictions,
             all_labels,
             self.model.score_dimensions,
-            is_regression=self.model.use_regression
+            is_regression=self.model.use_regression,
+            num_classes=self.model.num_classes,
         )
 
         return metrics

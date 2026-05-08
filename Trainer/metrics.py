@@ -30,7 +30,8 @@ def compute_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     dimension_name: str = "",
-    is_regression: bool = True
+    is_regression: bool = True,
+    num_classes: int = 5,
 ) -> Dict[str, float]:
     """
     Compute comprehensive metrics for a single dimension.
@@ -47,23 +48,15 @@ def compute_metrics(
     metrics = {}
 
     if is_regression:
-        # Round predictions to nearest integer for discrete metrics
         y_pred_rounded = np.round(y_pred).astype(int)
-        # Round and cast true labels too (they may be float averages like 3.67)
         y_true_rounded = np.round(y_true).astype(int)
-        # Clip to valid range [1, 5]
-        min_val = int(np.min(y_true_rounded))
-        max_val = int(np.max(y_true_rounded))
-        y_pred_rounded = np.clip(y_pred_rounded, min_val, max_val)
-        y_true_rounded = np.clip(y_true_rounded, 1, 5)
+        y_pred_rounded = np.clip(y_pred_rounded, 1, num_classes)
+        y_true_rounded = np.clip(y_true_rounded, 1, num_classes)
 
-        # Discrete metrics use rounded integers
         metrics['accuracy'] = accuracy_score(y_true_rounded, y_pred_rounded)
         metrics['macro_f1'] = f1_score(y_true_rounded, y_pred_rounded, average='macro', zero_division=0)
-
-        # QWK with rounded predictions
         try:
-            metrics['qwk'] = quadratic_weighted_kappa(y_true_rounded, y_pred_rounded)
+            metrics['qwk'] = quadratic_weighted_kappa(y_true_rounded, y_pred_rounded, num_classes=num_classes)
         except Exception:
             metrics['qwk'] = 0.0
 
@@ -96,7 +89,8 @@ def compute_multi_task_metrics(
     predictions: Dict[str, np.ndarray],
     labels: Dict[str, np.ndarray],
     score_dimensions: List[str],
-    is_regression: bool = True
+    is_regression: bool = True,
+    num_classes: int = 5,
 ) -> Dict[str, Any]:
     """
     Compute metrics for all score dimensions.
@@ -132,7 +126,7 @@ def compute_multi_task_metrics(
                 y_true_valid = y_true[valid_mask]
                 y_pred_valid = y_pred[valid_mask]
 
-                dim_metrics = compute_metrics(y_true_valid, y_pred_valid, dim, is_regression=is_regression)
+                dim_metrics = compute_metrics(y_true_valid, y_pred_valid, dim, is_regression=is_regression, num_classes=num_classes)
                 results['per_dimension'][dim] = dim_metrics
 
                 # Collect for averaging

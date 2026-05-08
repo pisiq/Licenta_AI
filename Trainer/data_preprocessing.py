@@ -76,16 +76,22 @@ _CONFERENCE_SCORE_MAX: Dict[str, float] = {
 @dataclass
 class PaperReview:
     """Data structure for a paper paired with its review scores."""
-    paper_id:        str
-    conference:      str
-    split:           str          # "train" / "dev" / "test"
-    title:           str
-    abstract:        str
-    paper_text:      str          # body sections from parsed PDF
-    review_comments: str          # concatenated reviewer comments
-    combined_text:   str          # PAPER [SEP] REVIEW (used during training)
-    scores:          Dict[str, Optional[float]]   # dim -> mean score or None
-    score_mask:      Dict[str, bool]              # dim -> True if valid
+    paper_id:          str
+    conference:        str
+    split:             str          # "train" / "dev" / "test"
+    title:             str
+    abstract:          str
+    paper_text:        str          # body sections from parsed PDF
+    review_comments:   str          # concatenated reviewer comments
+    combined_text:     str          # PAPER [SEP] REVIEW (used during training)
+    scores:            Dict[str, Optional[float]]   # dim -> mean score or None
+    score_mask:        Dict[str, bool]              # dim -> True if valid
+    # Per-reviewer scores (normalized to the active target scale). Populated by
+    # the loaders. None for legacy callers; safe to leave unset.
+    individual_scores: Optional[Dict[str, List[float]]] = None
+    # Per-reviewer confidences in [0.2, 1.0] = confidence/5.
+    # Aligned positionally with `individual_scores[primary_dim]`.
+    individual_confidences: Optional[List[Optional[float]]] = None
 
     @property
     def full_text(self) -> str:
@@ -240,11 +246,20 @@ class PaperReviewDataset(Dataset):
             labels[dim] = torch.tensor(float(score) if valid else float("nan"), dtype=torch.float32)
             label_mask[dim] = torch.tensor(1.0 if valid else 0.0, dtype=torch.float32)
 
+        # Per-sample confidence weight in (0, 1]. Defaults to 1.0 when no
+        # per-reviewer confidence is available. Post-expansion samples carry
+        # exactly one entry in `individual_confidences`.
+        conf_w = 1.0
+        ind_c = paper.individual_confidences
+        if ind_c is not None and len(ind_c) >= 1 and ind_c[0] is not None:
+            conf_w = float(ind_c[0])
+
         return {
             "input_ids": encoding["input_ids"].squeeze(0),
             "attention_mask": encoding["attention_mask"].squeeze(0),
             "labels": labels,
             "label_mask": label_mask,
+            "confidence_weight": torch.tensor(conf_w, dtype=torch.float32),
         }
 
 
@@ -272,13 +287,28 @@ def _parse_numeric(value: Any) -> Optional[float]:
     return None
 
 
-def _normalize_score(value: Optional[float], conf: str) -> Optional[float]:
+def _normalize_score(value: Optional[float], conf: str, target_scale: float = 5.0) -> Optional[float]:
+    """Normalize a raw rating to the target scale (default 5; pass 10 for native ICLR)."""
     if value is None:
         return None
     max_val = _CONFERENCE_SCORE_MAX.get(conf, 5.0)
-    if max_val == 10.0:
-        value = value / 10.0 * 5.0
-    return float(np.clip(value, 1.0, 5.0))
+    if max_val != target_scale:
+        value = value / max_val * target_scale
+    return float(np.clip(value, 1.0, target_scale))
+
+
+# Reviewer-confidence parsing. ICLR stores integers 1-5 (sometimes as
+# strings like "4: The reviewer is confident..."). Returns the normalized
+# weight in (0, 1] — confidence/5 — or None if missing.
+_CONFIDENCE_MAX = 5.0
+
+def _parse_confidence(rv: Dict[str, Any]) -> Optional[float]:
+    raw = rv.get("confidence")
+    val = _parse_numeric(raw)
+    if val is None:
+        return None
+    val = float(np.clip(val, 1.0, _CONFIDENCE_MAX))
+    return val / _CONFIDENCE_MAX  # -> [0.2, 1.0]
 
 
 def _load_parsed_pdf_text(parsed_path: str) -> Tuple[str, str, str]:
@@ -297,13 +327,22 @@ def _load_parsed_pdf_text(parsed_path: str) -> Tuple[str, str, str]:
     return title, abstract, body_text
 
 
-def _aggregate_scores(reviews: List[Dict[str, Any]], conf: str) -> Tuple[Dict[str, Optional[float]], Dict[str, bool]]:
+def _aggregate_scores(
+    reviews: List[Dict[str, Any]],
+    conf: str,
+    target_scale: float = 5.0,
+) -> Tuple[Dict[str, Optional[float]], Dict[str, bool], Dict[str, List[float]]]:
+    """Returns (mean_scores, score_mask, individual_scores) per dimension.
+
+    Scores are normalized to `target_scale`. The third element preserves each
+    reviewer's normalized score positionally so callers can replicate samples.
+    """
     dim_values: Dict[str, List[float]] = {dim: [] for dim in SCORE_DIMENSIONS}
     for rv in reviews:
         for dim in SCORE_DIMENSIONS:
             if dim in rv:
                 val = _parse_numeric(rv.get(dim))
-                val = _normalize_score(val, conf)
+                val = _normalize_score(val, conf, target_scale=target_scale)
                 if val is not None:
                     dim_values[dim].append(val)
 
@@ -316,7 +355,7 @@ def _aggregate_scores(reviews: List[Dict[str, Any]], conf: str) -> Tuple[Dict[st
         else:
             scores[dim] = None
             score_mask[dim] = False
-    return scores, score_mask
+    return scores, score_mask, dim_values
 
 
 def load_peerread_data(
@@ -326,9 +365,19 @@ def load_peerread_data(
     require_pdf: bool = True,
     verbose: bool = False,
     seed: int = 42,
+    target_scale: float = 5.0,
+    iclr_only: bool = False,
 ) -> List[PaperReview]:
-    """Load PeerRead-style data from ACL/CoNLL (split) and ICLR (flat) folders."""
+    """Load PeerRead-style data from ACL/CoNLL (split) and ICLR (flat) folders.
+
+    target_scale : 5.0 (PeerRead-normalized) or 10.0 (native ICLR) ratings.
+    iclr_only    : if True, restrict to ICLR conferences only.
+    """
     conference_folders = conference_folders or PEERREAD_ALL_CONFERENCES
+    if iclr_only:
+        conference_folders = [c for c in conference_folders if c in ICLR_CONFERENCES]
+        if verbose:
+            print(f"  [iclr_only=True] Loading only: {conference_folders}")
     rng = random.Random(seed)
     processed: List[PaperReview] = []
 
@@ -374,9 +423,11 @@ def load_peerread_data(
                         r.get("comments", "") for r in reviews if isinstance(r, dict) and r.get("comments")
                     ])
 
-                    scores, score_mask = _aggregate_scores(reviews, conf)
+                    scores, score_mask, individual = _aggregate_scores(reviews, conf, target_scale=target_scale)
                     if not any(score_mask.values()):
                         continue
+                    # ACL/CoNLL reviews don't carry a confidence field — leave None.
+                    individual_conf = [None] * len(individual.get("RECOMMENDATION", []))
 
                     title = text_preprocessor.preprocess(title)
                     abstract = text_preprocessor.preprocess(abstract)
@@ -394,6 +445,8 @@ def load_peerread_data(
                         combined_text=_build_combined_text(title, abstract, paper_text, review_comments),
                         scores=scores,
                         score_mask=score_mask,
+                        individual_scores=individual,
+                        individual_confidences=individual_conf,
                     ))
 
         elif conf in ICLR_CONFERENCES:
@@ -429,17 +482,21 @@ def load_peerread_data(
                 ])
 
                 rec_scores: List[float] = []
+                rec_confs: List[Optional[float]] = []
                 for rv in reviews:
                     rating = _parse_numeric(rv.get("rating"))
-                    rating = _normalize_score(rating, conf)
+                    rating = _normalize_score(rating, conf, target_scale=target_scale)
                     if rating is not None:
                         rec_scores.append(rating)
+                        rec_confs.append(_parse_confidence(rv))   # may be None
 
                 scores = {dim: None for dim in SCORE_DIMENSIONS}
                 score_mask = {dim: False for dim in SCORE_DIMENSIONS}
+                individual: Dict[str, List[float]] = {dim: [] for dim in SCORE_DIMENSIONS}
                 if rec_scores:
                     scores["RECOMMENDATION"] = float(np.mean(rec_scores))
                     score_mask["RECOMMENDATION"] = True
+                    individual["RECOMMENDATION"] = list(rec_scores)
 
                 if not any(score_mask.values()):
                     continue
@@ -457,6 +514,8 @@ def load_peerread_data(
                     combined_text=_build_combined_text(title, abstract, paper_text, review_comments),
                     scores=scores,
                     score_mask=score_mask,
+                    individual_scores=individual,
+                    individual_confidences=rec_confs,
                 ))
         else:
             if verbose:
@@ -533,9 +592,116 @@ def load_and_preprocess_data(
             combined_text=combined_text,
             scores=scores,
             score_mask=score_mask,
+            individual_scores=scores_raw,
         ))
 
     return processed
+
+
+def expand_per_reviewer(
+    papers: List[PaperReview],
+    primary_dim: str = "RECOMMENDATION",
+) -> List[PaperReview]:
+    """Replace each paper with N copies — one per individual reviewer score on
+    `primary_dim`. Other dimensions stay at their mean. Papers without
+    individual scores fall back to a single (mean-labeled) sample.
+
+    Use this on the TRAIN split only. The test split should keep one
+    sample per paper using the mean label.
+    """
+    expanded: List[PaperReview] = []
+    skipped = 0
+    for p in papers:
+        ind = (p.individual_scores or {}).get(primary_dim) if p.individual_scores else None
+        if not ind:
+            # No per-reviewer info — keep the paper as-is.
+            expanded.append(p)
+            skipped += 1
+            continue
+
+        confs = p.individual_confidences or [None] * len(ind)
+        # Defensive: pad/truncate if lengths got out of sync
+        if len(confs) < len(ind):
+            confs = list(confs) + [None] * (len(ind) - len(confs))
+        elif len(confs) > len(ind):
+            confs = list(confs)[:len(ind)]
+
+        for s, c in zip(ind, confs):
+            new_scores = dict(p.scores)
+            new_mask = dict(p.score_mask)
+            new_scores[primary_dim] = float(s)
+            new_mask[primary_dim] = True
+            expanded.append(PaperReview(
+                paper_id=f"{p.paper_id}#r{len(expanded)}",
+                conference=p.conference,
+                split=p.split,
+                title=p.title,
+                abstract=p.abstract,
+                paper_text=p.paper_text,
+                review_comments=p.review_comments,
+                combined_text=p.combined_text,
+                scores=new_scores,
+                score_mask=new_mask,
+                individual_scores=p.individual_scores,
+                # Single confidence value for THIS replicated sample.
+                individual_confidences=[c],
+            ))
+    print(f"[expand_per_reviewer] {len(papers)} papers -> {len(expanded)} samples "
+          f"(skipped {skipped} without per-reviewer info)")
+    return expanded
+
+
+def subsample_by_class(
+    papers: List[PaperReview],
+    cap: int,
+    primary_dim: str = "RECOMMENDATION",
+    num_classes: int = 5,
+    seed: int = 42,
+) -> List[PaperReview]:
+    """Randomly subsample classes that exceed `cap` down to exactly `cap`
+    samples. Classes at or below `cap` are kept untouched. Samples missing
+    a label on `primary_dim` are kept (they may carry signal for aux dims).
+
+    Use on the TRAIN split only.
+    """
+    rng = random.Random(seed)
+    by_class: Dict[int, List[int]] = {c: [] for c in range(num_classes)}
+    no_label_idx: List[int] = []
+
+    for i, p in enumerate(papers):
+        score = p.scores.get(primary_dim) if p.scores else None
+        valid = (
+            p.score_mask.get(primary_dim, False)
+            and score is not None
+            and not (isinstance(score, float) and np.isnan(score))
+        )
+        if not valid:
+            no_label_idx.append(i)
+            continue
+        c = int(np.clip(np.round(float(score)), 1, num_classes)) - 1
+        by_class[c].append(i)
+
+    keep_idx: List[int] = list(no_label_idx)
+    summary_before = []
+    summary_after = []
+    for c in range(num_classes):
+        bucket = by_class[c]
+        before = len(bucket)
+        if before > cap:
+            rng.shuffle(bucket)
+            kept = bucket[:cap]
+        else:
+            kept = bucket
+        keep_idx.extend(kept)
+        summary_before.append(before)
+        summary_after.append(len(kept))
+
+    keep_idx.sort()  # preserve original order
+    out = [papers[i] for i in keep_idx]
+    print(f"[subsample_by_class] cap={cap} | "
+          f"per-class before {summary_before} -> after {summary_after} "
+          f"(no-label kept: {len(no_label_idx)}) | total {len(papers)} -> {len(out)}")
+    return out
 
 
 def split_data(
@@ -547,28 +713,25 @@ def split_data(
 ) -> Tuple[List[PaperReview], List[PaperReview], List[PaperReview]]:
     """
     Smart splitter:
-      • If the data already has valid split labels (from pre-defined PeerRead
-        folders or from the ICLR auto-split), use them directly.
-      • Otherwise fall back to a random shuffle.
-
-    Dev is removed from the pipeline; the dev split is treated as test.
+      • If samples carry predefined split labels (PeerRead folder splits or
+        the ICLR auto-split), use them directly. Dev counts as test — the
+        pipeline only consumes train/test.
+      • Otherwise fall back to a random shuffle using train_ratio/test_ratio.
     """
-    has_predef = any(s.split in ("train", "dev", "test") for s in data)
-    train_has = any(s.split == "train" for s in data)
-    dev_has = any(s.split == "dev" for s in data)
+    train_has   = any(s.split == "train" for s in data)
+    test_or_dev = any(s.split in ("dev", "test") for s in data)
 
-    if has_predef and train_has and dev_has:
-        train = [s for s in data if s.split in ("train","test")]
-        test = [s for s in data if s.split == ("dev" )]
-        dev = []
-        return train, dev, test
+    if train_has and test_or_dev:
+        train = [s for s in data if s.split == "train"]
+        test  = [s for s in data if s.split in ("dev", "test")]
+        print(f"[split_data] using predefined splits: train={len(train)} test={len(test)} (dev folded into test)")
+        return train, [], test
 
+    # Fallback: random shuffle
     np.random.seed(seed)
     indices = np.random.permutation(len(data))
     n_train = int(len(data) * train_ratio)
-
     train = [data[i] for i in indices[:n_train]]
-    test = [data[i] for i in indices[n_train:]]
-    dev = []
-
-    return train, dev, test
+    test  = [data[i] for i in indices[n_train:]]
+    print(f"[split_data] random split (no predef labels): train={len(train)} test={len(test)}")
+    return train, [], test

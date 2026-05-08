@@ -19,6 +19,8 @@ from data_preprocessing import (
     load_peerread_data,
     load_and_preprocess_data,
     split_data,
+    expand_per_reviewer,
+    subsample_by_class,
     SCORE_DIMENSIONS,
     PEERREAD_ALL_CONFERENCES,
 )
@@ -27,6 +29,8 @@ from trainer import (
     Trainer,
     create_optimizer_and_scheduler,
     compute_class_weights,
+    count_classes,
+    print_class_distribution,
     make_weighted_sampler,
     set_seed,
 )
@@ -106,23 +110,27 @@ def collate_fn(batch):
 
     score_dimensions = list(batch[0]['labels'].keys())
 
-    # Labels: stack pre-built float tensors (NaN where score is missing)
     labels = {
         dim: torch.stack([item['labels'][dim] for item in batch])
         for dim in score_dimensions
     }
-
-    # Mask: stack pre-built float tensors (1.0 valid, 0.0 missing)
     label_mask = {
         dim: torch.stack([item['label_mask'][dim] for item in batch])
         for dim in score_dimensions
     }
 
+    # Per-sample confidence weights (defaults to 1.0 if dataset omitted them)
+    if 'confidence_weight' in batch[0]:
+        confidence_weight = torch.stack([item['confidence_weight'] for item in batch])
+    else:
+        confidence_weight = torch.ones(len(batch), dtype=torch.float32)
+
     return {
-        'input_ids':      input_ids,
-        'attention_mask': attention_mask,
-        'labels':         labels,
-        'label_mask':     label_mask,
+        'input_ids':         input_ids,
+        'attention_mask':    attention_mask,
+        'labels':            labels,
+        'label_mask':        label_mask,
+        'confidence_weight': confidence_weight,
     }
 
 
@@ -183,14 +191,18 @@ def main(args):
 
     # Load data
     if args.use_all_data:
-        print("\n[*] Loading ALL PeerRead data (ACL 2017, CoNLL 2016, ICLR 2017-2020)...")
+        iclr_only = getattr(data_config, 'iclr_only', False)
+        target_scale = float(getattr(data_config, 'score_scale', 5))
+        print(f"\n[*] Loading PeerRead data — iclr_only={iclr_only}, target_scale={target_scale}")
         all_data = load_peerread_data(
-            base_data_path    ='data',
+            base_data_path    = 'data',
             text_preprocessor = text_preprocessor,
             conference_folders = PEERREAD_ALL_CONFERENCES,
             require_pdf       = True,
             verbose           = True,
             seed              = training_config.seed,
+            target_scale      = target_scale,
+            iclr_only         = iclr_only,
         )
     else:
         print("\n[*] Loading data from single JSON file...")
@@ -213,6 +225,25 @@ def main(args):
     print(f"\n[*] Data split:")
     print(f"  Train: {len(train_data)} papers")
     print(f"  Test: {len(test_data)} papers")
+
+    # Per-reviewer expansion — TRAIN ONLY. Each paper becomes N samples,
+    # one per individual reviewer's score on RECOMMENDATION. Restores the
+    # rare class-0 / class-3 samples that mean-aggregation hides.
+    if getattr(data_config, 'expand_per_reviewer', False):
+        train_data = expand_per_reviewer(train_data, primary_dim="RECOMMENDATION")
+        print(f"  Train (after per-reviewer expansion): {len(train_data)} samples")
+
+    # Optional per-class cap — undersamples majority classes for more even exposure.
+    cap = getattr(data_config, 'train_class_cap', None)
+    if cap is not None and cap > 0:
+        train_data = subsample_by_class(
+            train_data,
+            cap=cap,
+            primary_dim="RECOMMENDATION",
+            num_classes=model_config.num_classes,
+            seed=training_config.seed,
+        )
+        print(f"  Train (after class-cap={cap}): {len(train_data)} samples")
 
     # Load tokenizer
     print(f"\nLoading tokenizer: {model_config.base_model_name}")
@@ -238,30 +269,52 @@ def main(args):
         inference_mode=True    # test: paper only (no review leakage)
     )
 
-    # Compute class weights if enabled
+    # ---- Class distribution diagnostics ---------------------------------
+    print("\nCounting class distribution (train)...")
+    train_counts = count_classes(
+        train_dataset,
+        model_config.score_dimensions,
+        model_config.num_classes,
+    )
+    print_class_distribution(train_counts, model_config.num_classes, title="Train class distribution")
+
+    print("\nCounting class distribution (test)...")
+    test_counts = count_classes(
+        test_dataset,
+        model_config.score_dimensions,
+        model_config.num_classes,
+    )
+    print_class_distribution(test_counts, model_config.num_classes, title="Test class distribution")
+
+    # ---- Class weights ---------------------------------------------------
     class_weights = None
     if training_config.use_class_weights:
-        manual = getattr(training_config, 'manual_class_weights', None)
-        if manual is not None:
+        mode = getattr(training_config, 'class_weight_mode', 'sqrt_inverse_freq')
+        post_boost = getattr(training_config, 'class_weight_post_boost', None)
+
+        if mode == 'manual':
+            manual = getattr(training_config, 'manual_class_weights', None)
+            assert manual is not None, "class_weight_mode='manual' requires manual_class_weights"
             manual_t = torch.tensor(list(manual), dtype=torch.float32)
             assert manual_t.numel() == model_config.num_classes, (
                 f"manual_class_weights length ({manual_t.numel()}) must equal "
                 f"num_classes ({model_config.num_classes})"
             )
             class_weights = {dim: manual_t.clone() for dim in model_config.score_dimensions}
-            print("\nUsing MANUAL class weights:")
-            for dim, weights in class_weights.items():
-                print(f"  {dim}: {weights.numpy()}")
+            print(f"\nClass weights (mode=manual):")
         else:
-            print("\nComputing class weights from inverse frequency...")
+            print(f"\nComputing class weights (mode={mode}, post_boost={post_boost})...")
             class_weights = compute_class_weights(
                 train_dataset,
                 model_config.score_dimensions,
-                model_config.num_classes
+                model_config.num_classes,
+                mode=mode,
+                post_boost=list(post_boost) if post_boost is not None else None,
+                counts=train_counts,
             )
-            print("Class weights computed:")
-            for dim, weights in class_weights.items():
-                print(f"  {dim}: {weights.numpy()}")
+
+        for dim, weights in class_weights.items():
+            print(f"  {dim}: {weights.numpy()}")
 
     # Create data loaders
     # num_workers=0 on Windows (avoids multiprocessing spawn issues)
@@ -324,6 +377,9 @@ def main(args):
         ordinal_smoothing=getattr(training_config, 'ordinal_smoothing', 0.1),
         ordinal_smoothing_temperature=getattr(training_config, 'ordinal_smoothing_temperature', 1.0),
         gradient_checkpointing=getattr(model_config, 'gradient_checkpointing', False),
+        chunk_aggregation=getattr(model_config, 'chunk_aggregation', 'attention'),
+        head_type=getattr(model_config, 'head_type', 'softmax'),
+        corn_thresholds=list(getattr(model_config, 'corn_thresholds', (0.5,)*(model_config.num_classes-1))),
     )
 
     model.to(device)
@@ -354,13 +410,19 @@ def main(args):
     # Train
     best_model_state = trainer.train(training_config.num_epochs)
 
-    # Evaluate on test set
+    # Evaluate on test set (the trainer.train() loop already loaded the BEST
+    # checkpoint into the model, so this is the best-model test eval).
     print("\n" + "="*80)
-    print("Evaluating on test set...")
+    print("BEST MODEL — Test set evaluation")
+    if best_model_state is not None:
+        print(f"  Best epoch        : {best_model_state.get('epoch', '?') + 1}"
+              if isinstance(best_model_state.get('epoch'), int) else "  Best epoch        : ?")
+        print(f"  Selection metric  : {best_model_state.get('best_metric', '?')}")
+        print(f"  Best dev score    : {best_model_state.get('best_score', '?')}")
     print("="*80)
 
     test_metrics = trainer.evaluate(test_dataloader)
-    print(trainer.metrics_tracker.format_metrics(test_metrics, "Test Set Metrics"))
+    print(trainer.metrics_tracker.format_metrics(test_metrics, "BEST MODEL Test Set Metrics"))
 
     if logger:
         step = training_config.num_epochs
@@ -415,8 +477,8 @@ def main(args):
             pred = all_predictions[dim]
             valid_mask = (~np.isnan(lab)) & (lab >= 1)
             if valid_mask.sum() > 0:
-                lab_int  = np.clip(np.round(lab[valid_mask]).astype(int),  1, 5)
-                pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, 5)
+                lab_int  = np.clip(np.round(lab[valid_mask]).astype(int),  1, model_config.num_classes)
+                pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, model_config.num_classes)
             else:
                 lab_int, pred_int = np.array([], dtype=int), np.array([], dtype=int)
             all_labels_rounded[dim]      = lab_int - 1
@@ -429,8 +491,8 @@ def main(args):
             pred = all_predictions[dim]
             valid_mask = (~np.isnan(lab)) & (lab >= 1)
             if valid_mask.sum() > 0:
-                lab_int = np.clip(np.round(lab[valid_mask]).astype(int), 1, 5)
-                pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, 5)
+                lab_int = np.clip(np.round(lab[valid_mask]).astype(int), 1, model_config.num_classes)
+                pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, model_config.num_classes)
             else:
                 lab_int, pred_int = np.array([], dtype=int), np.array([], dtype=int)
             all_labels_rounded[dim]      = lab_int - 1
@@ -448,6 +510,30 @@ def main(args):
         print(f"\n{dim}:")
         print(cm)
 
+    # =====================================================================
+    # FINAL SUMMARY — best model test metrics in one easy-to-read block
+    # =====================================================================
+    print("\n" + "=" * 80)
+    print("FINAL SUMMARY — BEST MODEL on TEST SET")
+    print("=" * 80)
+    if best_model_state is not None:
+        epoch_disp = best_model_state.get('epoch')
+        epoch_disp = (epoch_disp + 1) if isinstance(epoch_disp, int) else "?"
+        print(f"  Best epoch        : {epoch_disp}")
+        print(f"  Selection metric  : {best_model_state.get('best_metric', '?')}")
+        print(f"  Best dev score    : {best_model_state.get('best_score', '?')}")
+    rec = test_metrics.get('per_dimension', {}).get('RECOMMENDATION', {})
+    if rec:
+        print("\n  RECOMMENDATION (test):")
+        for k in ('accuracy', 'macro_f1', 'mae', 'qwk', 'spearman'):
+            if k in rec:
+                print(f"    {k:<10}: {rec[k]:.4f}")
+    for dim, cm in confusion_matrices.items():
+        print(f"\n  Confusion matrix [{dim}] (rows=true 1..5, cols=pred 1..5):")
+        for row in cm:
+            print("    " + "  ".join(f"{int(v):4d}" for v in row))
+    print("=" * 80 + "\n")
+
     # Save final results
     results = {
         'test_metrics': test_metrics,
@@ -464,7 +550,16 @@ def main(args):
     print(f"\n[OK] Test results saved to {results_path}")
 
     # Save JSON-friendly results for easy inspection
+    best_meta = None
+    if best_model_state is not None:
+        ep = best_model_state.get('epoch')
+        best_meta = {
+            'epoch': (ep + 1) if isinstance(ep, int) else None,
+            'selection_metric': best_model_state.get('best_metric'),
+            'best_dev_score': best_model_state.get('best_score'),
+        }
     json_results = {
+        'best_model': best_meta,
         'test_metrics': test_metrics,
         'confusion_matrices': {
             k: v.tolist() for k, v in confusion_matrices.items()
