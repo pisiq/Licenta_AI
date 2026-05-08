@@ -51,12 +51,19 @@ def _load_model(model_path: str, model_config: ModelConfig, device: torch.device
         score_dimensions=model_config.score_dimensions,
         num_classes=model_config.num_classes,
         dropout=model_config.hidden_dropout_prob,
-        use_regression=model_config.use_regression,
         use_aux_regression=model_config.use_aux_regression,
         aux_regression_weight=model_config.aux_regression_weight,
         aux_regression_loss=model_config.aux_regression_loss,
+        use_hierarchical=model_config.use_hierarchical,
+        chunk_size=model_config.chunk_size,
+        chunk_aggregation=model_config.chunk_aggregation,
         regression_decider_enabled=model_config.regression_decider_enabled,
-        regression_decider_margin=model_config.regression_decider_margin,
+        regression_strong_override_distance=model_config.regression_strong_override_distance,
+        corn_thresholds=(
+            list(model_config.corn_thresholds)
+            if model_config.corn_thresholds is not None
+            else None
+        ),
     )
 
     # Checkpoint stores state dict either at top level or under 'model_state_dict'
@@ -116,10 +123,10 @@ def _read_paper(paper_path: str, preprocessor: TextPreprocessor):
     )
 
 
-def _bar(score: float) -> str:
-    """Visual 1-5 bar for a predicted score."""
-    r = max(1, min(5, round(score)))
-    return f"{score:.2f}  [{'#'*r}{'-'*(5-r)}]  ({r}/5)"
+def _bar(score: float, num_classes: int = 5) -> str:
+    """Visual 1-K bar for a predicted score."""
+    r = max(1, min(num_classes, round(score)))
+    return f"{score:.2f}  [{'#'*r}{'-'*(num_classes-r)}]  ({r}/{num_classes})"
 
 
 # ---------------------------------------------------------------------------
@@ -202,12 +209,9 @@ def main():
 
     scores = {}
     for dim, pred in raw_preds.items():
-        if model_config.use_regression:
-            scores[dim] = float(pred.squeeze().cpu().item())
-        else:
-            dim_reg = reg_preds[dim] if reg_preds is not None else None
-            pred_class = model.resolve_class_predictions(pred, dim_reg).item()
-            scores[dim] = float(pred_class)
+        dim_reg = reg_preds[dim] if reg_preds is not None else None
+        pred_class = model.resolve_class_predictions(pred, dim_reg).item()
+        scores[dim] = float(pred_class)
 
     # --- output -----------------------------------------------------------
     if args.json:
@@ -228,13 +232,14 @@ def main():
         print("=" * W)
         print(f"  {'Dimension':<28}  Score")
         print(f"  {'-'*28}  {'------'}")
+        K = model_config.num_classes
         for dim, score in scores.items():
-            print(f"  {dim:<28}  {_bar(score)}")
+            print(f"  {dim:<28}  {_bar(score, K)}")
         avg = sum(scores.values()) / len(scores)
         print("=" * W)
-        print(f"  {'AVERAGE':<28}  {_bar(avg)}")
+        print(f"  {'AVERAGE':<28}  {_bar(avg, K)}")
         print("=" * W)
-        print("\n  Scale: 1=poor  3=average  5=excellent\n")
+        print(f"\n  Scale: 1 (poor)  ...  {K} (excellent)\n")
 
 
 if __name__ == "__main__":

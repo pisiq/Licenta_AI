@@ -503,6 +503,12 @@ def load_peerread_data(
 
                 split = "train" if review_file in train_set else "dev"
 
+                # Preprocess all text fields before building combined_text
+                title           = text_preprocessor.preprocess(title or "")
+                abstract        = text_preprocessor.preprocess(abstract or "")
+                paper_text      = text_preprocessor.preprocess(body_text or "")
+                review_comments = text_preprocessor.preprocess(review_comments or "")
+
                 processed.append(PaperReview(
                     paper_id=paper_id,
                     conference=conf,

@@ -1,11 +1,11 @@
 """
-Training utilities and trainer class.
+Training utilities and Trainer class for the CORN ordinal model.
 """
 import os
 import torch
 import numpy as np
-from typing import Dict, List, Optional, Sequence  # noqa: F401
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from typing import Dict, List, Optional
+from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
@@ -16,11 +16,14 @@ from model import MultiTaskOrdinalClassifier
 
 
 def set_seed(seed: int):
-    """Set random seeds for reproducibility."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
+
+# ---------------------------------------------------------------------------
+# Class-distribution diagnostics (used at startup, not during training)
+# ---------------------------------------------------------------------------
 
 def count_classes(
     dataset,
@@ -47,7 +50,6 @@ def print_class_distribution(
     num_classes: int = 5,
     title: str = "Class distribution",
 ) -> None:
-    """Pretty-print per-class counts and percentages for each dimension."""
     print(f"\n[{title}]")
     for dim, c in counts.items():
         total = int(c.sum())
@@ -59,111 +61,12 @@ def print_class_distribution(
         print(f"  {dim} [n={total}]  " + "  |  ".join(cells))
 
 
-def compute_class_weights(
-    dataset,
-    score_dimensions: List[str],
-    num_classes: int = 5,
-    mode: str = "sqrt_inverse_freq",
-    post_boost: Optional[List[float]] = None,
-    counts: Optional[Dict[str, np.ndarray]] = None,
-) -> Dict[str, torch.Tensor]:
-    """Compute class weights for handling class imbalance.
-
-    mode:
-      - "sqrt_inverse_freq" : weight ∝ 1/sqrt(count)
-      - "inverse_freq"      : weight ∝ 1/count
-    post_boost : optional length-num_classes multiplier applied AFTER the
-                 chosen formula (e.g. (1.0, 1.0, 1.0, 1.1, 1.0)).
-    counts     : if pre-computed (via count_classes), reuses them and skips
-                 the second iteration over the dataset.
-    """
-    if counts is None:
-        counts = count_classes(dataset, score_dimensions, num_classes)
-
-    if post_boost is None:
-        boost = np.ones(num_classes, dtype=np.float64)
-    else:
-        boost = np.asarray(post_boost, dtype=np.float64)
-        assert boost.shape == (num_classes,), "post_boost must have length num_classes"
-
-    class_weights = {}
-    for dim in score_dimensions:
-        raw = counts[dim].astype(np.float64)
-        present = raw > 0
-        w = np.zeros(num_classes, dtype=np.float64)
-
-        # Compute only for present classes; absent classes stay at 0 so the
-        # loss never punishes/rewards predicting them.
-        if mode == "inverse_freq":
-            w[present] = 1.0 / raw[present]
-        elif mode == "sqrt_inverse_freq":
-            w[present] = 1.0 / np.sqrt(raw[present])
-        else:
-            raise ValueError(f"Unknown class_weight_mode: {mode!r}")
-
-        w = w * boost
-        # Normalize so the mean weight over PRESENT classes = 1.
-        present_mean = w[present].mean() if present.any() else 1.0
-        if present_mean > 0:
-            w = w / present_mean
-        class_weights[dim] = torch.FloatTensor(w)
-
-    return class_weights
-
-
-def make_weighted_sampler(
-    dataset,
-    primary_dim: str = "RECOMMENDATION",
-    num_classes: int = 5,
-    minority_boost: float = 1.5,
-    minority_classes: tuple = (0, 3),
-) -> WeightedRandomSampler:
-    """Build a WeightedRandomSampler that oversamples rare classes.
-
-    Per-sample weight is inverse class frequency (with extra boost for
-    `minority_classes`). Samples with missing labels get weight 0 so they
-    are never drawn.
-    """
-    sample_classes = []
-    counts = np.zeros(num_classes, dtype=np.float64)
-
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        label = sample['labels'].get(primary_dim) if isinstance(sample['labels'], dict) else None
-        if label is None:
-            sample_classes.append(-1)
-            continue
-        label_val = float(label)
-        if np.isnan(label_val) or label_val < 1:
-            sample_classes.append(-1)
-            continue
-        c = int(np.clip(np.round(label_val), 1, num_classes)) - 1
-        counts[c] += 1
-        sample_classes.append(c)
-
-    counts = np.maximum(counts, 1.0)
-    class_w = 1.0 / counts
-    for mc in minority_classes:
-        if 0 <= mc < num_classes:
-            class_w[mc] *= minority_boost
-
-    sample_weights = np.array(
-        [class_w[c] if c >= 0 else 0.0 for c in sample_classes],
-        dtype=np.float64,
-    )
-
-    print(f"[OK] WeightedRandomSampler built — class counts: {counts.astype(int).tolist()}, "
-          f"effective per-class weights: {[f'{w:.4g}' for w in class_w]}")
-
-    return WeightedRandomSampler(
-        weights=torch.from_numpy(sample_weights).double(),
-        num_samples=len(dataset),
-        replacement=True,
-    )
-
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
 
 class Trainer:
-    """Trainer for multi-task ordinal classification/regression."""
+    """Trainer for the CORN ordinal model."""
 
     def __init__(
         self,
@@ -174,8 +77,7 @@ class Trainer:
         scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
         device: torch.device,
         config,
-        class_weights: Optional[Dict[str, torch.Tensor]] = None,
-        logger=None
+        logger=None,
     ):
         self.model = model
         self.train_dataloader = train_dataloader
@@ -184,26 +86,16 @@ class Trainer:
         self.scheduler = scheduler
         self.device = device
         self.config = config
-        self.class_weights = class_weights
         self.logger = logger
 
-        # AMP (Automatic Mixed Precision) for memory optimization
         self.use_amp = config.fp16 and torch.cuda.is_available()
         self.scaler = GradScaler(device="cuda") if self.use_amp else None
-
         if self.use_amp:
-            print("[OK] Using Automatic Mixed Precision (AMP) for faster training")
+            print("[OK] Using Automatic Mixed Precision (AMP)")
 
-        # Move class weights to device
-        if self.class_weights:
-            self.class_weights = {
-                dim: w.to(device) for dim, w in self.class_weights.items()
-            }
-
-        # Metrics tracker
         self.metrics_tracker = MetricsTracker(model.score_dimensions)
 
-        # Early stopping — use composite score so we don't stall at QWK=0
+        # Early stopping
         self.best_score = float('-inf')
         self.patience_counter = 0
         self.best_model_state = None
@@ -213,23 +105,23 @@ class Trainer:
         if self.freeze_epochs > 0:
             print(f"[OK] Will freeze backbone for first {self.freeze_epochs} epochs")
 
+    # ---- backbone control ------------------------------------------------
+
     def freeze_backbone(self):
-        """Freeze the encoder backbone."""
-        for param in self.model.encoder.parameters():
-            param.requires_grad = False
+        for p in self.model.encoder.parameters():
+            p.requires_grad = False
         print("[FROZEN] Backbone frozen")
 
     def unfreeze_backbone(self):
-        """Unfreeze the encoder backbone."""
-        for param in self.model.encoder.parameters():
-            param.requires_grad = True
+        for p in self.model.encoder.parameters():
+            p.requires_grad = True
         print("[UNFROZEN] Backbone unfrozen")
 
+    # ---- training --------------------------------------------------------
+
     def train_epoch(self, epoch: int) -> float:
-        """Train for one epoch."""
         self.model.train()
 
-        # Handle backbone freezing
         if self.freeze_epochs > 0:
             if epoch < self.freeze_epochs:
                 self.freeze_backbone()
@@ -238,177 +130,118 @@ class Trainer:
 
         total_loss = 0.0
         num_batches = 0
+        progress = tqdm(self.train_dataloader, desc=f"Epoch {epoch}", dynamic_ncols=True, leave=True)
 
-        progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch}", dynamic_ncols=True, leave=True)
-
-        for batch_idx, batch in enumerate(progress_bar):
-            # Move to device
+        for batch_idx, batch in enumerate(progress):
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = {
                 dim: batch['labels'][dim].to(self.device)
                 for dim in self.model.score_dimensions
             }
-            # label_mask is optional (new dataset provides it, old collate may not)
-            label_mask = {
-                dim: batch['label_mask'][dim].to(self.device)
-                for dim in self.model.score_dimensions
-            } if 'label_mask' in batch else None
 
-            # Optional per-sample confidence weights
             sample_weights = None
             if getattr(self.config, 'use_confidence_weighting', False) and 'confidence_weight' in batch:
                 sample_weights = batch['confidence_weight'].to(self.device)
 
-            # Forward pass with AMP
             if self.use_amp:
                 with autocast(device_type="cuda"):
                     outputs = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         labels=labels,
-                        class_weights=self.class_weights,
                         sample_weights=sample_weights,
                     )
                     loss = outputs['loss']
-
-                # Backward pass with gradient scaling
                 self.scaler.scale(loss).backward()
-
-                # Gradient accumulation
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                    # Gradient clipping (unscale first)
                     self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.max_grad_norm
-                    )
-
-                    # Optimizer step
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-
                     if self.scheduler:
                         self.scheduler.step()
                     self.optimizer.zero_grad()
             else:
-                # Regular training without AMP
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     labels=labels,
-                    class_weights=self.class_weights
+                    sample_weights=sample_weights,
                 )
                 loss = outputs['loss']
-
-                # Backward pass
                 loss.backward()
-
-                # Gradient accumulation
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.max_grad_norm
-                    )
-
-                    # Optimizer step
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     self.optimizer.step()
                     if self.scheduler:
                         self.scheduler.step()
                     self.optimizer.zero_grad()
 
-            # Track loss
             total_loss += loss.item()
             num_batches += 1
 
-            # Update progress bar with total + RECOMMENDATION loss
             per_task = outputs.get('per_task_loss', {})
             rec_loss = per_task.get('RECOMMENDATION', None)
             postfix = {'loss': f"{loss.item():.4f}"}
             if rec_loss is not None:
                 postfix['rec'] = f"{rec_loss.item():.4f}"
-            progress_bar.set_postfix(postfix)
+            progress.set_postfix(postfix)
 
-            # Logging
             if self.logger and (batch_idx + 1) % self.config.logging_steps == 0:
                 step = epoch * len(self.train_dataloader) + batch_idx
                 self.logger.add_scalar('train/loss', loss.item(), step)
                 if self.scheduler:
                     self.logger.add_scalar('train/lr', self.scheduler.get_last_lr()[0], step)
 
-        avg_loss = total_loss / num_batches
-        return avg_loss
+        return total_loss / max(num_batches, 1)
+
+    # ---- evaluation ------------------------------------------------------
 
     def evaluate(self, dataloader: DataLoader) -> Dict:
-        """Evaluate on a dataset."""
         self.model.eval()
-
         all_predictions = {dim: [] for dim in self.model.score_dimensions}
-        all_labels = {dim: [] for dim in self.model.score_dimensions}
+        all_labels      = {dim: [] for dim in self.model.score_dimensions}
 
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Evaluating"):
-                # Move to device
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels']
 
-                # Forward pass (with AMP if enabled)
                 if self.use_amp:
                     with autocast(device_type="cuda"):
-                        outputs = self.model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask
-                        )
+                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 else:
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask
-                    )
+                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
 
-                predictions = outputs['predictions']
-                regression_predictions = outputs.get('regression_predictions')
+                preds = outputs['predictions']
+                reg_preds = outputs.get('regression_predictions')
 
-                # Collect predictions and labels  (skip NaN / missing labels)
                 for dim in self.model.score_dimensions:
-                    dim_labels = labels[dim].numpy()  # may contain NaN
+                    dim_labels = labels[dim].numpy()
+                    rp = reg_preds[dim] if reg_preds is not None else None
+                    pred_classes = self.model.resolve_class_predictions(preds[dim], rp).cpu().numpy()
+                    labels_valid = np.clip(np.round(dim_labels), 1, self.model.num_classes)
 
-                    if self.model.use_regression:
-                        preds = predictions[dim].cpu().numpy()
-                        labels_valid = dim_labels
-                    else:
-                        reg_preds = regression_predictions[dim] if regression_predictions is not None else None
-                        pred_classes = self.model.resolve_class_predictions(
-                            predictions[dim],
-                            reg_preds
-                        )
-                        preds = pred_classes.cpu().numpy()
-                        labels_valid = np.clip(np.round(dim_labels), 1, self.model.num_classes)
-
-
-                    # Only keep samples with a valid (non-NaN, >= 1) label
                     valid_mask = (~np.isnan(dim_labels)) & (dim_labels >= 1)
-                    all_predictions[dim].extend(preds[valid_mask])
+                    all_predictions[dim].extend(pred_classes[valid_mask])
                     all_labels[dim].extend(labels_valid[valid_mask])
 
-        # Convert to numpy arrays
-        all_predictions = {dim: np.array(preds) for dim, preds in all_predictions.items()}
-        all_labels = {dim: np.array(labs) for dim, labs in all_labels.items()}
+        all_predictions = {dim: np.array(p) for dim, p in all_predictions.items()}
+        all_labels      = {dim: np.array(l) for dim, l in all_labels.items()}
 
-        # Compute metrics
-        metrics = compute_multi_task_metrics(
+        return compute_multi_task_metrics(
             all_predictions,
             all_labels,
             self.model.score_dimensions,
-            is_regression=self.model.use_regression,
+            is_regression=False,
             num_classes=self.model.num_classes,
         )
 
-        return metrics
+    # ---- training loop ---------------------------------------------------
 
     def train(self, num_epochs: int):
-        """Full training loop."""
         print("Starting training...")
         print(f"Number of epochs: {num_epochs}")
         print(f"Train batches: {len(self.train_dataloader)}")
@@ -418,69 +251,48 @@ class Trainer:
             print("Dev batches: 0 (dev disabled; using test only)")
 
         for epoch in range(num_epochs):
-            print(f"\n{'='*80}")
-            print(f"Epoch {epoch + 1}/{num_epochs}")
-            print(f"{'='*80}")
+            print(f"\n{'='*80}\nEpoch {epoch + 1}/{num_epochs}\n{'='*80}")
 
-            # Train
             train_loss = self.train_epoch(epoch)
             print(f"\nTrain Loss: {train_loss:.4f}")
 
-            # Evaluate on dev set (if provided)
             if self.dev_dataloader is not None:
                 print("\nEvaluating on dev set...")
                 dev_metrics = self.evaluate(self.dev_dataloader)
-
-                # Log metrics
                 print(self.metrics_tracker.format_metrics(dev_metrics, "Dev Set Metrics"))
-
-                # Update tracker
                 self.metrics_tracker.update(epoch, train_loss, dev_metrics)
 
-                # TensorBoard logging
                 if self.logger:
                     self.logger.add_scalar('train/epoch_loss', train_loss, epoch)
-                    # Recommendation-specific (primary target)
-                    self.logger.add_scalar('dev/recommendation_spearman', dev_metrics.get('recommendation_spearman', 0.0), epoch)
-                    self.logger.add_scalar('dev/recommendation_qwk',      dev_metrics.get('recommendation_qwk', 0.0),      epoch)
-                    self.logger.add_scalar('dev/recommendation_mae',       dev_metrics.get('recommendation_mae', 5.0),       epoch)
-                    self.logger.add_scalar('dev/recommendation_accuracy',  dev_metrics.get('recommendation_accuracy', 0.0),  epoch)
-                    self.logger.add_scalar('dev/recommendation_macro_f1',  dev_metrics.get('recommendation_macro_f1', 0.0),  epoch)
-                    self.logger.add_scalar('dev/recommendation_rmse',      dev_metrics.get('recommendation_rmse', 0.0),      epoch)
-                    # All-dimension averages (secondary, for context)
-                    self.logger.add_scalar('dev/avg_qwk', dev_metrics['avg_qwk'], epoch)
-                    self.logger.add_scalar('dev/avg_accuracy', dev_metrics.get('macro_avg', {}).get('accuracy', 0.0), epoch)
-                    for metric_name, value in dev_metrics['macro_avg'].items():
-                        self.logger.add_scalar(f'dev/macro_{metric_name}', value, epoch)
+                    for k in ('spearman', 'qwk', 'mae', 'accuracy', 'macro_f1', 'rmse'):
+                        v = dev_metrics.get(f'recommendation_{k}')
+                        if v is not None:
+                            self.logger.add_scalar(f'dev/recommendation_{k}', v, epoch)
+                    self.logger.add_scalar('dev/avg_qwk', dev_metrics.get('avg_qwk', 0.0), epoch)
+                    for name, value in dev_metrics.get('macro_avg', {}).items():
+                        self.logger.add_scalar(f'dev/macro_{name}', value, epoch)
 
-                # ------------------------------------------------------------------
-                # Early stopping — use the configured metric on RECOMMENDATION.
-                # ------------------------------------------------------------------
-                metric_key = getattr(self.config, 'early_stopping_metric', 'recommendation_spearman')
+                metric_key = getattr(self.config, 'early_stopping_metric', 'recommendation_qwk')
                 current_score = dev_metrics.get(metric_key, 0.0)
 
                 if current_score > self.best_score:
                     self.best_score = current_score
                     self.patience_counter = 0
-                    # Save best model
                     self.best_model_state = {
                         'epoch': epoch,
                         'model_state_dict': self.model.state_dict(),
                         'optimizer_state_dict': self.optimizer.state_dict(),
                         'best_metric': metric_key,
                         'best_score': current_score,
-                        'metrics': dev_metrics
+                        'metrics': dev_metrics,
                     }
                     print(f"\n[BEST] New best model!  {metric_key}={current_score:.4f}")
-
-                    # Save checkpoint
                     self.save_checkpoint(epoch, is_best=True)
                 else:
                     self.patience_counter += 1
                     print(f"\nNo improvement in {metric_key}. "
-                          f"Patience: {self.patience_counter}/{self.config.early_stopping_patience}"
-                          f"  ({metric_key}={current_score:.4f}, best={self.best_score:.4f})")
-
+                          f"Patience: {self.patience_counter}/{self.config.early_stopping_patience}  "
+                          f"({metric_key}={current_score:.4f}, best={self.best_score:.4f})")
                     if self.patience_counter >= self.config.early_stopping_patience:
                         print(f"\n[STOP] Early stopping triggered after {epoch + 1} epochs")
                         break
@@ -488,22 +300,21 @@ class Trainer:
                 if self.logger:
                     self.logger.add_scalar('train/epoch_loss', train_loss, epoch)
 
-            # Save periodic checkpoint
             if (epoch + 1) % self.config.save_steps == 0:
                 self.save_checkpoint(epoch, is_best=False)
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("Training completed!")
         if self.dev_dataloader is not None:
             best_epoch, best_qwk = self.metrics_tracker.get_best_metrics()
-            metric_key = getattr(self.config, 'early_stopping_metric', 'recommendation_spearman')
+            metric_key = getattr(self.config, 'early_stopping_metric', 'recommendation_qwk')
             print(f"Best model: Epoch {best_epoch + 1}  "
                   f"({metric_key}: {self.best_score:.4f}  |  Avg QWK: {best_qwk:.4f})")
         else:
             print("Best model: dev disabled; keeping last epoch weights")
-        print("="*80)
+        print("=" * 80)
 
-        # Load best model
+        # Load best weights
         if self.best_model_state:
             self.model.load_state_dict(self.best_model_state['model_state_dict'])
             print("\n[OK] Best model loaded")
@@ -514,89 +325,59 @@ class Trainer:
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'best_metric': None,
                 'best_score': None,
-                'metrics': None
+                'metrics': None,
             }
 
         return self.best_model_state
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save model checkpoint."""
         os.makedirs(self.config.output_dir, exist_ok=True)
-
-        checkpoint = {
+        ckpt = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'config': self.config
+            'config': self.config,
         }
-
         if is_best:
             path = os.path.join(self.config.output_dir, 'best_model.pt')
-            torch.save(checkpoint, path)
+            torch.save(ckpt, path)
             print(f"[OK] Best model saved to {path}")
         else:
             path = os.path.join(self.config.output_dir, f'checkpoint_epoch_{epoch}.pt')
-            torch.save(checkpoint, path)
+            torch.save(ckpt, path)
             print(f"[OK] Checkpoint saved to {path}")
 
 
 def create_optimizer_and_scheduler(
     model: torch.nn.Module,
     train_dataloader: DataLoader,
-    config
+    config,
 ):
-    """Create optimizer with differential learning rates and scheduler."""
-
-    # Separate parameters for backbone and heads
     backbone_params = []
     head_params = []
-
     for name, param in model.named_parameters():
         if 'encoder' in name:
             backbone_params.append(param)
         else:
             head_params.append(param)
 
-    # Create parameter groups with differential learning rates
-    # During freezing, only heads will train. After unfreezing, use different LRs.
-    optimizer_grouped_parameters = [
-        {
-            'params': backbone_params,
-            'lr': config.backbone_lr,  # Lower LR for pretrained encoder
-            'weight_decay': config.weight_decay
-        },
-        {
-            'params': head_params,
-            'lr': config.head_lr,  # Higher LR for regression heads
-            'weight_decay': config.weight_decay
-        }
+    groups = [
+        {'params': backbone_params, 'lr': config.backbone_lr, 'weight_decay': config.weight_decay},
+        {'params': head_params,     'lr': config.head_lr,     'weight_decay': config.weight_decay},
     ]
+    optimizer = AdamW(groups, eps=config.adam_epsilon)
 
-    # Optimizer with parameter groups
-    optimizer = AdamW(
-        optimizer_grouped_parameters,
-        eps=config.adam_epsilon
-    )
-
-    # Learning rate scheduler
     num_training_steps = len(train_dataloader) * config.num_epochs // config.gradient_accumulation_steps
-
-    # Use warmup_steps if provided, otherwise use warmup_ratio
-    if hasattr(config, 'warmup_steps') and config.warmup_steps is not None:
+    if getattr(config, 'warmup_steps', None) is not None:
         num_warmup_steps = config.warmup_steps
     else:
         num_warmup_steps = int(num_training_steps * config.warmup_ratio)
-
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps
+        num_training_steps=num_training_steps,
     )
 
-    print(f"[OK] Optimizer: AdamW with differential LRs")
-    print(f"  - Backbone LR: {config.backbone_lr:.2e}")
-    print(f"  - Head LR: {config.head_lr:.2e}")
-    print(f"  - Weight decay: {config.weight_decay}")
-    print(f"[OK] Scheduler: Linear warmup ({num_warmup_steps} steps / {config.warmup_ratio*100:.0f}%) + decay ({num_training_steps} total steps)")
-
+    print(f"[OK] AdamW with differential LRs: backbone={config.backbone_lr:.2e}, head={config.head_lr:.2e}")
+    print(f"[OK] Linear warmup ({num_warmup_steps} steps / {config.warmup_ratio*100:.0f}%) + decay ({num_training_steps} total)")
     return optimizer, scheduler

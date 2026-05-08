@@ -28,10 +28,8 @@ from model import MultiTaskOrdinalClassifier
 from trainer import (
     Trainer,
     create_optimizer_and_scheduler,
-    compute_class_weights,
     count_classes,
     print_class_distribution,
-    make_weighted_sampler,
     set_seed,
 )
 from metrics import compute_confusion_matrices
@@ -286,57 +284,15 @@ def main(args):
     )
     print_class_distribution(test_counts, model_config.num_classes, title="Test class distribution")
 
-    # ---- Class weights ---------------------------------------------------
-    class_weights = None
-    if training_config.use_class_weights:
-        mode = getattr(training_config, 'class_weight_mode', 'sqrt_inverse_freq')
-        post_boost = getattr(training_config, 'class_weight_post_boost', None)
+    # CORN doesn't use per-class weights at training time — the ordinal
+    # structure (and per-sample confidence weighting, when enabled) handles
+    # imbalance. Class distribution is printed above for diagnostics only.
 
-        if mode == 'manual':
-            manual = getattr(training_config, 'manual_class_weights', None)
-            assert manual is not None, "class_weight_mode='manual' requires manual_class_weights"
-            manual_t = torch.tensor(list(manual), dtype=torch.float32)
-            assert manual_t.numel() == model_config.num_classes, (
-                f"manual_class_weights length ({manual_t.numel()}) must equal "
-                f"num_classes ({model_config.num_classes})"
-            )
-            class_weights = {dim: manual_t.clone() for dim in model_config.score_dimensions}
-            print(f"\nClass weights (mode=manual):")
-        else:
-            print(f"\nComputing class weights (mode={mode}, post_boost={post_boost})...")
-            class_weights = compute_class_weights(
-                train_dataset,
-                model_config.score_dimensions,
-                model_config.num_classes,
-                mode=mode,
-                post_boost=list(post_boost) if post_boost is not None else None,
-                counts=train_counts,
-            )
-
-        for dim, weights in class_weights.items():
-            print(f"  {dim}: {weights.numpy()}")
-
-    # Create data loaders
-    # num_workers=0 on Windows (avoids multiprocessing spawn issues)
-    # pin_memory=True speeds up CPU→GPU transfers on CUDA
     _pin = device.type == 'cuda'
-
-    train_sampler = None
-    if getattr(training_config, 'use_weighted_sampler', False):
-        print("\nBuilding WeightedRandomSampler for class-balanced batches...")
-        train_sampler = make_weighted_sampler(
-            train_dataset,
-            primary_dim="RECOMMENDATION",
-            num_classes=model_config.num_classes,
-            minority_boost=getattr(training_config, 'sampler_minority_boost', 1.0),
-            minority_classes=(0, 3),
-        )
-
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=training_config.train_batch_size,
-        shuffle=(train_sampler is None),
-        sampler=train_sampler,
+        shuffle=True,
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=_pin,
@@ -356,30 +312,26 @@ def main(args):
 
     # Create model
     print(f"\nInitializing model: {model_config.base_model_name}")
-    print(f"Mode: {'Regression' if model_config.use_regression else 'Classification'}")
+    print(f"Head: CORN (K={model_config.num_classes}) + aux Huber regression")
     model = MultiTaskOrdinalClassifier(
         base_model_name=model_config.base_model_name,
         score_dimensions=model_config.score_dimensions,
         num_classes=model_config.num_classes,
         dropout=model_config.hidden_dropout_prob,
-        use_regression=model_config.use_regression,
         use_aux_regression=model_config.use_aux_regression,
         aux_regression_weight=model_config.aux_regression_weight,
         aux_regression_loss=model_config.aux_regression_loss,
         use_hierarchical=model_config.use_hierarchical,
         chunk_size=model_config.chunk_size,
+        chunk_aggregation=model_config.chunk_aggregation,
         regression_decider_enabled=model_config.regression_decider_enabled,
-        regression_decider_margin=model_config.regression_decider_margin,
-        regression_strong_override_distance=getattr(model_config, 'regression_strong_override_distance', 0.0),
-        use_focal_loss=getattr(training_config, 'use_focal_loss', False),
-        focal_gamma=getattr(training_config, 'focal_gamma', 2.0),
-        use_ordinal_smoothing=getattr(training_config, 'use_ordinal_smoothing', False),
-        ordinal_smoothing=getattr(training_config, 'ordinal_smoothing', 0.1),
-        ordinal_smoothing_temperature=getattr(training_config, 'ordinal_smoothing_temperature', 1.0),
-        gradient_checkpointing=getattr(model_config, 'gradient_checkpointing', False),
-        chunk_aggregation=getattr(model_config, 'chunk_aggregation', 'attention'),
-        head_type=getattr(model_config, 'head_type', 'softmax'),
-        corn_thresholds=list(getattr(model_config, 'corn_thresholds', (0.5,)*(model_config.num_classes-1))),
+        regression_strong_override_distance=model_config.regression_strong_override_distance,
+        gradient_checkpointing=model_config.gradient_checkpointing,
+        corn_thresholds=(
+            list(model_config.corn_thresholds)
+            if model_config.corn_thresholds is not None
+            else None
+        ),
     )
 
     model.to(device)
@@ -387,14 +339,8 @@ def main(args):
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    # Create optimizer and scheduler
-    optimizer, scheduler = create_optimizer_and_scheduler(
-        model,
-        train_dataloader,
-        training_config
-    )
+    optimizer, scheduler = create_optimizer_and_scheduler(model, train_dataloader, training_config)
 
-    # Create trainer
     trainer = Trainer(
         model=model,
         train_dataloader=train_dataloader,
@@ -403,8 +349,7 @@ def main(args):
         scheduler=scheduler,
         device=device,
         config=training_config,
-        class_weights=class_weights,
-        logger=logger
+        logger=logger,
     )
 
     # Train
@@ -453,50 +398,30 @@ def main(args):
             regression_predictions = outputs.get('regression_predictions')
 
             for dim in model_config.score_dimensions:
-                if model_config.use_regression:
-                    # Continuous predictions - round for confusion matrix
-                    preds = predictions[dim].cpu().numpy()
-                else:
-                    # Classification predictions (regression-guided if enabled)
-                    reg_preds = regression_predictions[dim] if regression_predictions is not None else None
-                    pred_classes = model.resolve_class_predictions(predictions[dim], reg_preds)
-                    preds = pred_classes.cpu().numpy()
-                all_predictions[dim].extend(preds)
+                # CORN classification, regression-guided override at inference
+                reg_preds = regression_predictions[dim] if regression_predictions is not None else None
+                pred_classes = model.resolve_class_predictions(predictions[dim], reg_preds)
+                all_predictions[dim].extend(pred_classes.cpu().numpy())
                 all_labels[dim].extend(labels[dim].numpy())
 
     import numpy as np
     all_predictions = {dim: np.array(preds) for dim, preds in all_predictions.items()}
     all_labels      = {dim: np.array(labs)  for dim, labs  in all_labels.items()}
 
-    # Filter NaN labels and round both labels and preds to int for confusion matrix
-    if model_config.use_regression:
-        all_predictions_rounded = {}
-        all_labels_rounded = {}
-        for dim in model_config.score_dimensions:
-            lab = all_labels[dim]
-            pred = all_predictions[dim]
-            valid_mask = (~np.isnan(lab)) & (lab >= 1)
-            if valid_mask.sum() > 0:
-                lab_int  = np.clip(np.round(lab[valid_mask]).astype(int),  1, model_config.num_classes)
-                pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, model_config.num_classes)
-            else:
-                lab_int, pred_int = np.array([], dtype=int), np.array([], dtype=int)
-            all_labels_rounded[dim]      = lab_int - 1
-            all_predictions_rounded[dim] = pred_int - 1
-    else:
-        all_predictions_rounded = {}
-        all_labels_rounded = {}
-        for dim in model_config.score_dimensions:
-            lab = all_labels[dim]
-            pred = all_predictions[dim]
-            valid_mask = (~np.isnan(lab)) & (lab >= 1)
-            if valid_mask.sum() > 0:
-                lab_int = np.clip(np.round(lab[valid_mask]).astype(int), 1, model_config.num_classes)
-                pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, model_config.num_classes)
-            else:
-                lab_int, pred_int = np.array([], dtype=int), np.array([], dtype=int)
-            all_labels_rounded[dim]      = lab_int - 1
-            all_predictions_rounded[dim] = pred_int - 1
+    # Round labels and preds to int for confusion matrix
+    all_predictions_rounded = {}
+    all_labels_rounded = {}
+    for dim in model_config.score_dimensions:
+        lab = all_labels[dim]
+        pred = all_predictions[dim]
+        valid_mask = (~np.isnan(lab)) & (lab >= 1)
+        if valid_mask.sum() > 0:
+            lab_int  = np.clip(np.round(lab[valid_mask]).astype(int),  1, model_config.num_classes)
+            pred_int = np.clip(np.round(pred[valid_mask]).astype(int), 1, model_config.num_classes)
+        else:
+            lab_int, pred_int = np.array([], dtype=int), np.array([], dtype=int)
+        all_labels_rounded[dim]      = lab_int - 1
+        all_predictions_rounded[dim] = pred_int - 1
 
     confusion_matrices = compute_confusion_matrices(
         all_predictions_rounded,
