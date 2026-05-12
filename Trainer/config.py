@@ -29,13 +29,16 @@ class ModelConfig:
 
     # Auxiliary regression head — strongly recommended ON
     use_aux_regression: bool = True
-    aux_regression_weight: float = 0.5
+    # Bumped 0.5 -> 0.7 to lean harder on the Spearman-strong ordering signal.
+    aux_regression_weight: float = 0.7
     aux_regression_loss: str = "huber"  # "huber" | "mse"
 
     # Inference: regression decider
     regression_decider_enabled: bool = True
     # If |regression - top1| >= this, override CORN top1 with round(regression).
-    regression_strong_override_distance: float = 1.5
+    # Lowered 1.5 -> 1.0 (= 10% of K=10 scale) so override fires more often
+    # and pulls predictions away from the score-7 magnet.
+    regression_strong_override_distance: float = 1.0
 
     # CORN per-binary-head thresholds (length = num_classes - 1).
     # None = 0.5 everywhere. Raise thresholds[0] (e.g. 0.65) to encourage
@@ -70,7 +73,7 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
 
     # Schedule
-    num_epochs: int = 15
+    num_epochs: int = 20
     train_batch_size: int = 2
     eval_batch_size: int = 4
     gradient_accumulation_steps: int = 4
@@ -86,7 +89,8 @@ class TrainingConfig:
     freeze_backbone_epochs: int = 2
 
     # Early stopping
-    early_stopping_patience: int = 3
+    # Bumped 3 -> 5: previous best was epoch 8/15 — model still had headroom.
+    early_stopping_patience: int = 5
     early_stopping_metric: str = "recommendation_qwk"
 
     # Confidence-weighted training: each per-reviewer training sample's loss
@@ -132,4 +136,6 @@ class DataConfig:
     expand_per_reviewer: bool = True
 
     # Optional per-class cap on train set (after expansion). None = off.
-    train_class_cap: Optional[int] = None
+    # Set to 2000 to cap the dominant 5/6/7/8 buckets and reduce the
+    # "score 7 magnet" pattern observed in the previous run.
+    train_class_cap: Optional[int] = 2000
