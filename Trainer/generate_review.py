@@ -37,6 +37,7 @@ from Trainer.config import ModelConfig, DataConfig
 from Trainer.data_preprocessing import TextPreprocessor, _build_paper_only_text, SCORE_DIMENSIONS
 from Trainer.inference import _load_model, _read_paper, _bar
 from Trainer.review_parser import parse_structured_output
+from Trainer.pdf_parser import parse_pdf_to_json_file
 
 # ---------------------------------------------------------------------------
 # Default paths
@@ -55,79 +56,17 @@ MAX_NEW_TOKENS    = 512
 # ===========================================================================
 
 def pdf_to_json(pdf_path: str, out_json_path: str) -> str:
-    """
-    Parse a PDF file to the internal JSON format used by the project.
-    Returns the path to the saved JSON file.
-    """
-    try:
-        import pymupdf4llm
-    except ImportError:
-        raise ImportError(
-            "pymupdf4llm not installed. Run: pip install pymupdf4llm"
-        )
+    """Parse a PDF using the centralized pdf_parser (font-size title detection,
+    author/affiliation filtering, markdown-bold stripping). Writes the
+    Science-Parse-compatible JSON to `out_json_path` and returns that path.
 
+    Note: pdf_parser writes to `metadata.abstractText`. _read_paper in
+    inference.py already reads either `abstractText` or `abstract`, so the
+    rest of the pipeline doesn't need to change.
+    """
     print(f"  Parsing PDF: {pdf_path}")
-    md_text: str = pymupdf4llm.to_markdown(pdf_path)
-
-    # -----------------------------------------------------------------------
-    # Convert markdown to the project's parsed PDF JSON structure:
-    #   { "metadata": {...}, "sections": [{"heading": ..., "text": ...}] }
-    # -----------------------------------------------------------------------
-    lines   = md_text.split("\n")
-    sections = []
-    current_heading = "Abstract"
-    current_text: list[str] = []
-
-    for line in lines:
-        stripped = line.strip()
-        # Detect markdown headings as section breaks
-        if stripped.startswith("#"):
-            # Save previous section
-            if current_text:
-                sections.append({
-                    "heading": current_heading,
-                    "text":    "\n".join(current_text).strip(),
-                })
-                current_text = []
-            current_heading = stripped.lstrip("#").strip()
-        else:
-            if stripped:
-                current_text.append(stripped)
-
-    # Flush last section
-    if current_text:
-        sections.append({
-            "heading": current_heading,
-            "text":    "\n".join(current_text).strip(),
-        })
-
-    # Try to extract title (first heading or first bold line)
-    title = ""
-    for sec in sections:
-        if sec["heading"] and sec["heading"].lower() not in ("abstract",):
-            title = sec["heading"]
-            break
-
-    # Build abstract
-    abstract = ""
-    for sec in sections:
-        if "abstract" in sec["heading"].lower():
-            abstract = sec["text"]
-            break
-
-    parsed = {
-        "metadata": {
-            "title":    title,
-            "abstract": abstract,
-        },
-        "sections": sections,
-    }
-
     os.makedirs(os.path.dirname(out_json_path) or ".", exist_ok=True)
-    with open(out_json_path, "w", encoding="utf-8") as f:
-        json.dump(parsed, f, indent=2, ensure_ascii=False)
-
-    print(f"  JSON saved → {out_json_path}")
+    parse_pdf_to_json_file(pdf_path, out_json_path)
     return out_json_path
 
 

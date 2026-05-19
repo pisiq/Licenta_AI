@@ -105,51 +105,185 @@ def _strip_md_formatting(text: str) -> str:
     return text.strip()
 
 
+# Keywords that strongly indicate a heading/line is an author affiliation,
+# page header, journal name, or other non-title content. Lowercase comparison.
+_AFFILIATION_KEYWORDS = (
+    "university", "universit", "department", "departament", "institute",
+    "laboratory", " lab ", "academy", "faculty", "school of",
+    "google", "microsoft", "facebook", "openai", "deepmind", "amazon",
+    "@", "email", "e-mail", ".edu", ".com", ".org", "http", "www.",
+    "street", "avenue", "boulevard", "road",
+    "proceedings of", "in proc.", "preprint", "submitted", "arxiv:",
+    "doi:", "isbn:", "issn:",
+    "copyright", "©",
+)
+
+
+def _looks_like_author_or_affiliation(text: str) -> bool:
+    """Heuristic: is this short heading-or-line actually an author/affiliation/
+    journal header rather than a paper title?"""
+    if not text:
+        return True
+    t = text.lower().strip()
+    if len(t) < 4 or len(t) > 220:   # titles are rarely shorter than 4 chars or > 220
+        return True
+    # Affiliation/contact keywords
+    if any(kw in t for kw in _AFFILIATION_KEYWORDS):
+        return True
+    # Pure-numbers / page numbers / DOI fragments
+    if re.fullmatch(r"[\d\.\-:/\s]+", t):
+        return True
+    # All lowercase short heading → likely a section sub-heading, not a title
+    if t == t.lower() and len(t) < 40 and " " not in t.strip():
+        return True
+    return False
+
+
+def _extract_title_by_font_size(pdf_path: str) -> str:
+    """Find the most likely paper title using font-size analysis of page 1.
+
+    Academic papers almost always typeset the title in the LARGEST font on
+    the first page. We collect all text spans by font size, sort
+    descending, and walk down the list until we find spans that don't look
+    like authors/affiliations/page headers.
+    """
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        try:
+            import fitz   # older pymupdf
+        except ImportError:
+            return ""
+
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception:
+        return ""
+
+    if len(doc) == 0:
+        doc.close()
+        return ""
+
+    page = doc[0]
+    try:
+        blocks = page.get_text("dict").get("blocks", [])
+    except Exception:
+        doc.close()
+        return ""
+
+    # Group consecutive same-size spans, sort by size desc, then by y-position.
+    # entries: list[(size, y_top, text)]
+    entries: List[Tuple[float, float, str]] = []
+    for block in blocks:
+        if block.get("type", 0) != 0:   # 0 = text block
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                txt = (span.get("text") or "").strip()
+                if not txt:
+                    continue
+                size = float(span.get("size", 0.0))
+                y_top = float(span.get("bbox", [0, 0, 0, 0])[1])
+                entries.append((round(size, 1), y_top, txt))
+
+    doc.close()
+    if not entries:
+        return ""
+
+    # Bucket text by font size; iterate sizes from largest to smallest
+    sizes = sorted({e[0] for e in entries}, reverse=True)
+    for size in sizes:
+        same_size = [(y, t) for s, y, t in entries if s == size]
+        same_size.sort(key=lambda yt: yt[0])  # top-of-page first
+        # Join adjacent spans into one candidate title string
+        candidate = " ".join(t for _, t in same_size).strip()
+        candidate = re.sub(r"\s+", " ", candidate)
+        candidate = _strip_md_formatting(candidate)
+        if _looks_like_author_or_affiliation(candidate):
+            continue
+        # Real-title sanity: should have at least one space (multi-word) AND
+        # at least one alphabetic character.
+        if " " not in candidate or not re.search(r"[A-Za-z]", candidate):
+            continue
+        # Looks plausible
+        return candidate
+
+    return ""
+
+
 def _extract_title_and_abstract(
     sections: List[Dict[str, str]],
     doc_metadata: Dict[str, Any],
+    title_hint: str = "",
 ) -> Tuple[str, str, List[Dict[str, str]]]:
     """
-    Try to pull the paper title and abstract from the section list or from
-    the PDF document metadata.  Returns ``(title, abstract, remaining_sections)``.
+    Try to pull the paper title and abstract from the section list, the PDF
+    document metadata, or a pre-computed font-size title hint.
+
+    Returns ``(title, abstract, remaining_sections)``.
     """
-    title: str = doc_metadata.get("title", "") or ""
+    # 1. Title precedence: font-size-detected hint > PDF metadata > headings
+    title: str = ""
+    if title_hint and not _looks_like_author_or_affiliation(title_hint):
+        title = title_hint
+    elif doc_metadata.get("title"):
+        meta_title = _strip_md_formatting(str(doc_metadata["title"])).strip()
+        if not _looks_like_author_or_affiliation(meta_title):
+            title = meta_title
+
     abstract: str = ""
     remaining: List[Dict[str, str]] = []
 
     for sec in sections:
         heading = sec["heading"]
         heading_lower = heading.lower()
+        text = sec["text"]
+        text_stripped = text.strip()
 
         # Section heading that IS the title (bold Markdown heading like **Paper Title**)
         bold_heading = re.match(r"^\*{1,3}(.+?)\*{1,3}$", heading.strip())
         if bold_heading and not title:
-            title = bold_heading.group(1).strip()
-            # Don't include this section in remaining — it's just the title block
-            continue
+            candidate = bold_heading.group(1).strip()
+            if not _looks_like_author_or_affiliation(candidate):
+                title = candidate
+                continue   # consume the section
 
+        # Headingless first block: may start with a bold title line
         if not title and not heading_lower:
-            # The very first headingless block may start with a bold title line
-            lines = sec["text"].split("\n")
-            first_line = lines[0].strip()
+            lines = text.split("\n")
+            first_line = lines[0].strip() if lines else ""
             bold_match = re.match(r"^\*{1,3}(.+?)\*{1,3}$", first_line)
             if bold_match:
-                title = bold_match.group(1).strip()
-                # Keep the rest of the text as a section (if non-empty)
-                rest = "\n".join(lines[1:]).strip()
-                if rest:
-                    remaining.append({"heading": heading, "text": rest})
-            else:
-                if first_line:
-                    title = _strip_md_formatting(first_line)
+                cand = bold_match.group(1).strip()
+                if not _looks_like_author_or_affiliation(cand):
+                    title = cand
+                    rest = "\n".join(lines[1:]).strip()
+                    if rest:
+                        remaining.append({"heading": heading, "text": rest})
+                    continue
+            elif first_line and not _looks_like_author_or_affiliation(_strip_md_formatting(first_line)):
+                title = _strip_md_formatting(first_line)
+                continue
+
+        # Abstract: only accept a section whose heading literally references
+        # "abstract" AND whose content is substantial (≥ 80 chars). This skips
+        # bogus initial sections that contain just page-header text.
+        if re.search(r"\babstract\b", heading_lower) and len(text_stripped) >= 80 and not abstract:
+            abstract = text_stripped
             continue
 
-        if re.search(r"\babstract\b", heading_lower):
-            abstract = sec["text"]
-        else:
-            # Strip bold markers from section headings for cleaner downstream use
-            clean_sec = {"heading": _strip_md_formatting(heading), "text": sec["text"]}
-            remaining.append(clean_sec)
+        # Otherwise keep as a body section. Drop sections that are noise:
+        #   - heading matches the detected title exactly (it's the title block)
+        #   - heading OR short content looks like author/affiliation/journal header
+        clean_heading = _strip_md_formatting(heading)
+        if title and clean_heading.strip().lower() == title.strip().lower():
+            continue
+        text_preview = text_stripped[:300]
+        heading_bad = _looks_like_author_or_affiliation(clean_heading)
+        content_bad = _looks_like_author_or_affiliation(text_preview)
+        if (heading_bad or content_bad) and len(text_stripped) < 300:
+            continue
+        remaining.append({"heading": clean_heading, "text": text})
 
     return title.strip(), abstract.strip(), remaining
 
@@ -227,15 +361,21 @@ def parse_pdf_to_json(
         authors = [a.strip() for a in raw_authors if a.strip()]
 
     # ------------------------------------------------------------------
-    # 3. Split Markdown into sections
+    # 3. Font-size title detection (most reliable for academic PDFs)
+    # ------------------------------------------------------------------
+    font_size_title = _extract_title_by_font_size(str(pdf_path))
+
+    # ------------------------------------------------------------------
+    # 4. Split Markdown into sections
     # ------------------------------------------------------------------
     all_sections = _split_markdown_into_sections(md_text)
 
     title, abstract, body_sections = _extract_title_and_abstract(
-        all_sections, raw_meta
+        all_sections, raw_meta, title_hint=font_size_title
     )
 
-    # Fall back to PDF metadata title if we still have nothing
+    # Final fallback: raw PDF metadata title even if it contains affiliation
+    # keywords — better than nothing for downstream display.
     if not title and raw_meta.get("title"):
         title = raw_meta["title"].strip()
 
