@@ -148,6 +148,27 @@ class TextPreprocessor:
         text = self.truncate_text(text)
         return text
 
+    def preprocess_preserving_structure(self, text: str) -> str:
+        """Gentle preprocessor for text where layout is signal (e.g. reviewer
+        comments). Strips control characters and does UTF-8 sanitization but
+        leaves newlines, bullet markers, and section headers intact.
+
+        Specifically does NOT do `re.sub(r'\\s+', ' ')` (which collapses
+        newlines) or `re.sub(r'- ', '')` (which removes bullet dashes) —
+        both of which destroy the structure the review parser depends on.
+        """
+        if not text:
+            return ""
+        text = re.sub(r"\x00", "", text)
+        text = re.sub(r"[\x01-\x08\x0b-\x0c\x0e-\x1f]", "", text)
+        text = text.encode("utf-8", errors="ignore").decode("utf-8")
+        # Collapse only excessive blank lines (3+ → 2) — keeps paragraphs
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        # Truncate if needed (use the same max_length as `preprocess`)
+        if len(text) > self.max_length:
+            text = text[: self.max_length]
+        return text.strip()
+
 
 # ===========================================================================
 # Review aggregator (legacy helper kept for API compat)
@@ -432,7 +453,7 @@ def load_peerread_data(
                     title = text_preprocessor.preprocess(title)
                     abstract = text_preprocessor.preprocess(abstract)
                     paper_text = text_preprocessor.preprocess(body_text)
-                    review_comments = text_preprocessor.preprocess(review_comments)
+                    review_comments = text_preprocessor.preprocess_preserving_structure(review_comments)
 
                     processed.append(PaperReview(
                         paper_id=paper_id,
@@ -507,7 +528,7 @@ def load_peerread_data(
                 title           = text_preprocessor.preprocess(title or "")
                 abstract        = text_preprocessor.preprocess(abstract or "")
                 paper_text      = text_preprocessor.preprocess(body_text or "")
-                review_comments = text_preprocessor.preprocess(review_comments or "")
+                review_comments = text_preprocessor.preprocess_preserving_structure(review_comments or "")
 
                 processed.append(PaperReview(
                     paper_id=paper_id,
@@ -584,7 +605,7 @@ def load_and_preprocess_data(
         title = text_preprocessor.preprocess(title)
         abstract = text_preprocessor.preprocess(abstract)
         paper_text = text_preprocessor.preprocess(paper_text)
-        review_comments = text_preprocessor.preprocess(review_comments)
+        review_comments = text_preprocessor.preprocess_preserving_structure(review_comments)
         combined_text = _build_combined_text(title, abstract, paper_text, review_comments)
 
         processed.append(PaperReview(

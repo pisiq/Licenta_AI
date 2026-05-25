@@ -36,8 +36,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from Trainer.config import ModelConfig, DataConfig
 from Trainer.data_preprocessing import TextPreprocessor, _build_paper_only_text, SCORE_DIMENSIONS
 from Trainer.inference import _load_model, _read_paper, _bar
-from Trainer.review_parser import parse_structured_output
 from Trainer.pdf_parser import parse_pdf_to_json_file
+# NOTE: review_parser is no longer used. The generator now produces a single
+# summary paragraph; the output is rendered as-is. Kept on disk for possible
+# future structured experiments.
 
 # ---------------------------------------------------------------------------
 # Default paths
@@ -48,7 +50,28 @@ DEFAULT_GEN_MODEL_HF  = "razent/SciFive-base-Pubmed_PMC"   # fallback if no fine
 
 PAPER_BODY_CHARS  = 3_500
 MAX_INPUT_TOKENS  = 1024
-MAX_NEW_TOKENS    = 512
+MAX_NEW_TOKENS    = 384   # was 512 — shorter cap fights runaway repetition
+
+# Headers that we strip from the output. The model is trained to stop after
+# the summary section, but in case it occasionally emits a leading
+# "SUMMARY:" prefix or starts a trailing section, we trim defensively.
+_LEADING_SUMMARY_RE = __import__("re").compile(r"^\s*SUMMARY\s*:\s*", __import__("re").IGNORECASE)
+_TRAILING_HEADERS    = ("STRENGTHS:", "WEAKNESSES:", "QUESTIONS:",
+                        "Strengths:", "Weaknesses:", "Questions:",
+                        "STRENGTHS\n", "WEAKNESSES\n", "QUESTIONS\n")
+
+
+def _trim_to_summary(text: str) -> str:
+    """Drop leading 'SUMMARY:' prefix and anything after the first trailing
+    section header (STRENGTHS/WEAKNESSES/QUESTIONS). Belt-and-suspenders for
+    cases where the model leaks part of the prompt template."""
+    text = _LEADING_SUMMARY_RE.sub("", text)
+    cut = len(text)
+    for h in _TRAILING_HEADERS:
+        i = text.find(h)
+        if i != -1 and i < cut:
+            cut = i
+    return text[:cut].rstrip(" \n\t-••:") or text
 
 
 # ===========================================================================
@@ -132,8 +155,13 @@ def _build_gen_prompt(
     num_classes: int = 5,
     venue: str = "an academic venue",
 ) -> str:
-    """Mirror the training-time prompt — ask for the structured SUMMARY /
-    STRENGTHS / WEAKNESSES / QUESTIONS output explicitly."""
+    """Structured-review prompt — mirrors the training-time prompt.
+
+    The training targets are only the summary section, so the model will
+    produce the summary content and stop. We keep the structured prompt
+    because empirically it produces more focused output than a bare
+    "write a summary" prompt.
+    """
     K = int(num_classes)
     scores_parts = [
         f"{dim}: {val:.2f}/{K}"
@@ -165,13 +193,13 @@ def generate_review_text(
     device:    torch.device,
     *,
     max_new_tokens:        int   = MAX_NEW_TOKENS,
-    min_new_tokens:        int   = 120,
+    min_new_tokens:        int   = 80,           # was 120 — let it stop earlier when done
     num_beams:             int   = 1,
-    top_p:                 float = 0.92,
+    top_p:                 float = 0.90,         # was 0.92 — slightly tighter nucleus
     top_k:                 int   = 50,
-    temperature:           float = 0.85,
-    repetition_penalty:    float = 1.18,
-    no_repeat_ngram_size:  int   = 4,
+    temperature:           float = 0.80,         # was 0.85 — slightly cooler
+    repetition_penalty:    float = 1.30,         # was 1.18 — penalize repeats harder
+    no_repeat_ngram_size:  int   = 5,            # was 4 — block longer repeated phrases
     seed:                  Optional[int] = None,
     num_classes:           int   = 5,
 ) -> str:
@@ -297,19 +325,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_generate",   action="store_true",
                    help="Skip review text generation (only predict scores)")
     p.add_argument("--max_new_tokens",       type=int,   default=MAX_NEW_TOKENS)
-    p.add_argument("--min_new_tokens",       type=int,   default=120,
+    p.add_argument("--min_new_tokens",       type=int,   default=80,
                    help="Force the model to produce at least this many new tokens.")
     p.add_argument("--num_beams",            type=int,   default=1,
                    help="1 = sampling (default). >1 falls back to beam search.")
-    p.add_argument("--top_p",                type=float, default=0.92,
+    p.add_argument("--top_p",                type=float, default=0.90,
                    help="Nucleus sampling top-p. Only used when --num_beams==1.")
     p.add_argument("--top_k",                type=int,   default=50,
                    help="Top-k sampling. Only used when --num_beams==1.")
-    p.add_argument("--temperature",          type=float, default=0.85,
+    p.add_argument("--temperature",          type=float, default=0.80,
                    help="Sampling temperature. Only used when --num_beams==1.")
-    p.add_argument("--repetition_penalty",   type=float, default=1.18,
-                   help=">1.0 discourages token repetition. 1.0 = off.")
-    p.add_argument("--no_repeat_ngram_size", type=int,   default=4,
+    p.add_argument("--repetition_penalty",   type=float, default=1.30,
+                   help=">1.0 discourages token repetition. 1.0 = off. 1.3 is fairly strict.")
+    p.add_argument("--no_repeat_ngram_size", type=int,   default=5,
                    help="Disallow repeating n-grams of this size in the output.")
     p.add_argument("--seed",                 type=int,   default=None,
                    help="Random seed for sampling reproducibility.")
@@ -367,36 +395,14 @@ def main():
         num_classes=model_config.num_classes,
     )
 
-    # Parse the structured output for pretty rendering. If the model failed to
-    # follow the format, parsed sections will be empty and we'll show the raw
-    # text so the user can still see what came out.
-    parsed = parse_structured_output(review_text)
-
+    # Summary-only rendering: the entire model output IS the summary.
+    # Safety trim removes any stray prompt-template leakage.
+    review_text = _trim_to_summary(review_text)
     W = 70
     print("\n" + "=" * W)
-    print("  GENERATED REVIEW (structured)")
+    print("  GENERATED SUMMARY")
     print("=" * W)
-    if parsed.get("summary"):
-        print("SUMMARY:")
-        print(f"  {parsed['summary']}\n")
-    if parsed.get("strengths"):
-        print("STRENGTHS:")
-        for b in parsed["strengths"]:
-            print(f"  + {b}")
-        print()
-    if parsed.get("weaknesses"):
-        print("WEAKNESSES:")
-        for b in parsed["weaknesses"]:
-            print(f"  - {b}")
-        print()
-    if parsed.get("questions"):
-        print("QUESTIONS:")
-        for b in parsed["questions"]:
-            print(f"  ? {b}")
-        print()
-    if not any(parsed.get(k) for k in ("summary", "strengths", "weaknesses", "questions")):
-        print("[WARN] Model did not produce the expected structure. Raw output:")
-        print(review_text)
+    print(review_text.strip())
     print("=" * W)
 
     # ---- Save output -------------------------------------------------------
@@ -410,28 +416,10 @@ def main():
         f.write("=== PREDICTED SCORES ===\n")
         for dim, score in scores.items():
             f.write(f"  {dim}: {score:.3f}/{K}\n")
-        f.write("\n=== GENERATED REVIEW (raw) ===\n\n")
-        f.write(review_text)
-        f.write("\n\n=== GENERATED REVIEW (parsed) ===\n\n")
-        if parsed.get("summary"):
-            f.write("SUMMARY:\n")
-            f.write(f"  {parsed['summary']}\n\n")
-        if parsed.get("strengths"):
-            f.write("STRENGTHS:\n")
-            for b in parsed["strengths"]:
-                f.write(f"  + {b}\n")
-            f.write("\n")
-        if parsed.get("weaknesses"):
-            f.write("WEAKNESSES:\n")
-            for b in parsed["weaknesses"]:
-                f.write(f"  - {b}\n")
-            f.write("\n")
-        if parsed.get("questions"):
-            f.write("QUESTIONS:\n")
-            for b in parsed["questions"]:
-                f.write(f"  ? {b}\n")
-            f.write("\n")
-    print(f"\n  Review saved → {out_path}")
+        f.write("\n=== GENERATED SUMMARY ===\n\n")
+        f.write(review_text.strip())
+        f.write("\n")
+    print(f"\n  Summary saved → {out_path}")
 
 
 if __name__ == "__main__":

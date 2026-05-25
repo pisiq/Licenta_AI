@@ -18,18 +18,10 @@ from Trainer.config import DataConfig, ModelConfig
 from Trainer.generate_review import generate_review_text, pdf_to_json, predict_scores
 
 OUTPUTS_DIR = ROOT_DIR / "outputs"
-SCORING_MODEL_PATH = Path(os.getenv("SCORING_MODEL_PATH", OUTPUTS_DIR / "best_model.pt"))
+SCORING_MODEL_PATH = Path(os.getenv("SCORING_MODEL_PATH", OUTPUTS_DIR / "run_20260509_112307/best_model.pt"))
 
-_GEN_CANDIDATES = [
-	OUTPUTS_DIR / "review_gen_fast" / "best_review_gen_model",
-	OUTPUTS_DIR / "review_gen" / "best_review_gen_model",
-]
-GEN_MODEL_PATH = Path(os.getenv("GEN_MODEL_PATH", _GEN_CANDIDATES[0]))
-if not GEN_MODEL_PATH.exists():
-	for candidate in _GEN_CANDIDATES:
-		if candidate.exists():
-			GEN_MODEL_PATH = candidate
-			break
+GEN_MODEL_PATH = Path(os.getenv("GENERATIVE_MODEL_PATH", OUTPUTS_DIR / "review_gen/run_20260523_165628/best_review_gen_model"))
+
 
 
 def _now_ms() -> int:

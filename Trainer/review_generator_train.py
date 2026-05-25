@@ -30,6 +30,7 @@ import os
 import sys
 import json
 import math
+import datetime
 from functools import partial
 from typing import List, Dict, Optional
 
@@ -61,7 +62,13 @@ from Trainer.data_preprocessing import (
     PEERREAD_ALL_CONFERENCES,
     ICLR_CONFERENCES,
 )
-from Trainer.review_parser import parse_review, format_structured_target
+# NOTE: we use parse_review() to EXTRACT THE SUMMARY SECTION from each
+# review and use it as the training target. The structured prompt (asking
+# for SUMMARY/STRENGTHS/WEAKNESSES/QUESTIONS) is kept because it
+# previously produced clean focused summaries — but training only on the
+# summary section teaches the model to stop after the summary, so we no
+# longer get the trailing empty STRENGTHS:/WEAKNESSES:/QUESTIONS: headers.
+from Trainer.review_parser import parse_review
 
 # ---------------------------------------------------------------------------
 # Default configuration
@@ -107,11 +114,14 @@ def _scores_text(
 
 
 def build_input_prompt(paper: PaperReview, num_classes: int = 10) -> str:
-    """Build the seq2seq input prompt asking for a structured review.
+    """Build the seq2seq input prompt — structured-review framing.
 
-    The prompt explicitly demands the output format (SUMMARY / STRENGTHS /
-    WEAKNESSES / QUESTIONS), which combined with structured training
-    targets prevents mode-collapse into freeform prose.
+    The prompt asks the model for a structured review (SUMMARY / STRENGTHS /
+    WEAKNESSES / QUESTIONS). The TRAINING TARGET, however, is only the
+    parsed SUMMARY section of the reference review (see ReviewGenDataset).
+    Net effect: the model produces a focused summary in the same voice as
+    the structured prompt — and stops, because it never saw a trailing
+    STRENGTHS/WEAKNESSES section in the targets.
     """
     body_excerpt = paper.paper_text[:PAPER_BODY_CHARS] if paper.paper_text else ""
     scores_str   = _scores_text(
@@ -154,17 +164,20 @@ class ReviewGenDataset(Dataset):
         max_review_chars:  int = 30000,
         min_mean_confidence: float = 0.4,
         num_classes:       int = 10,
-        keep_unparseable:  bool = True,
+        max_target_chars:  int = 800,
+        min_summary_chars: int = 100,
     ):
         self.tokenizer         = tokenizer
         self.max_input_length  = max_input_length
         self.max_target_length = max_target_length
         self.num_classes       = num_classes
 
-        # (paper, pre-formatted structured target) tuples — we run the parser
-        # ONCE at construction time so __getitem__ stays fast.
+        # Training target = the SUMMARY section parsed out of the reviewer's
+        # comments. The prompt asks for a full structured review, but the
+        # target ends after the summary — so the model learns "produce a
+        # focused summary, then stop." No trailing empty STRENGTHS/WEAKNESSES.
         self.samples: List = []
-        n_short = n_long = n_lowconf = n_unparsed = n_freeform = 0
+        n_short = n_long = n_lowconf = n_unparsed = n_no_summary = 0
         for p in data:
             rc = (p.review_comments or "").strip()
             if not rc:
@@ -180,26 +193,36 @@ class ReviewGenDataset(Dataset):
                 if confs and (sum(confs) / len(confs)) < min_mean_confidence:
                     n_lowconf += 1
                     continue
-            parsed = parse_review(rc, allow_freeform=keep_unparseable)
+            # Require an extractable summary section. Reject reviews without
+            # any recognized structure (allow_freeform=False) so we don't
+            # train on opinionated reviewer rants as "summary".
+            parsed = parse_review(rc, allow_freeform=False)
             if parsed is None:
                 n_unparsed += 1
                 continue
-            # Distinguish "had structure" from "freeform fallback" for stats
-            if not parsed.get("strengths") and not parsed.get("weaknesses") and not parsed.get("questions"):
-                n_freeform += 1
-            target_text = format_structured_target(parsed)
+            summary = (parsed.get("summary") or "").strip()
+            if (not summary
+                    or summary == "(no summary provided)"
+                    or len(summary) < min_summary_chars):
+                n_no_summary += 1
+                continue
+            # Normalise whitespace; cap length so targets are dense paragraphs.
+            target_text = " ".join(summary.split())
+            if len(target_text) > max_target_chars:
+                target_text = target_text[:max_target_chars].rsplit(" ", 1)[0] + "..."
             self.samples.append((p, target_text))
 
         n_in = len(data)
         n_out = len(self.samples)
-        n_structured = n_out - n_freeform
-        print(f"  ReviewGenDataset: {n_out}/{n_in} samples kept  "
-              f"(structured={n_structured}, summary-only={n_freeform})")
-        print(f"    dropped: <{min_review_chars}chars={n_short}, >{max_review_chars}chars={n_long}, "
-              f"low_conf<{min_mean_confidence}={n_lowconf}, unparseable={n_unparsed}")
+        print(f"  ReviewGenDataset (summary-section target): {n_out}/{n_in} samples kept")
+        print(f"    dropped: <{min_review_chars}chars={n_short}, "
+              f">{max_review_chars}chars={n_long}, "
+              f"low_conf<{min_mean_confidence}={n_lowconf}, "
+              f"no_structure={n_unparsed}, "
+              f"no_summary_section={n_no_summary}")
         if n_out == 0:
-            print("  [WARN] zero samples remain. Try --no_keep_unparseable=False (it's True by default), "
-                  "or lower --min_review_chars.")
+            print("  [WARN] zero samples remain. Relax --min_summary_chars or "
+                  "--min_mean_confidence.")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -384,8 +407,12 @@ def train(
             tokenizer.save_pretrained(best_dir)
             print(f"  ★ New best model saved → {best_dir}  (dev_loss={dev_loss:.4f})")
 
+    best_path = os.path.join(output_dir, 'best_review_gen_model')
     print(f"\nTraining complete. Best dev_loss={best_dev_loss:.4f}")
-    print(f"Best model saved at: {os.path.join(output_dir, 'best_review_gen_model')}")
+    print(f"Best model saved at: {best_path}")
+    print(f"\nTo run inference with this model:")
+    print(f"  python Trainer\\generate_review.py --pdf paper.pdf \\")
+    print(f"      --gen_model \"{best_path}\"")
 
 
 # ===========================================================================
@@ -421,9 +448,12 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum length of review_comments to include a sample")
     p.add_argument("--max_review_chars",  type=int, default=30000,
                    help="Drop only obviously-spam reviews. Real ICLR reviews can be 8k-15k chars.")
-    p.add_argument("--keep_unparseable",  action="store_true", default=True,
-                   help="Keep reviews that don't parse into sections; format them as summary-only.")
-    p.add_argument("--no_keep_unparseable", dest="keep_unparseable", action="store_false")
+    # Idea 4: train the target on the SUMMARY section parsed out of the
+    # reviewer comments. Two new knobs control quality of that target.
+    p.add_argument("--max_target_chars",  type=int, default=800,
+                   help="Truncate parsed summary to this many characters (keep targets dense).")
+    p.add_argument("--min_summary_chars", type=int, default=100,
+                   help="Drop reviews whose parsed summary section is shorter than this.")
     p.add_argument("--min_mean_confidence", type=float, default=0.4,
                    help="Drop papers whose mean reviewer confidence is below this (0-1). 0 disables.")
     p.add_argument("--conferences", nargs="*", default=None,
@@ -436,16 +466,85 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _resolve_under_project_root(path: str) -> str:
+    """Resolve a relative path against the project root (parent of Trainer/).
+
+    Stripts leading "../" segments so the legacy default "../outputs/..." now
+    points INSIDE the project regardless of CWD.
+    """
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cleaned = path.replace("\\", "/").lstrip("./")
+    while cleaned.startswith("../"):
+        cleaned = cleaned[3:]
+    return os.path.normpath(os.path.join(project_root, cleaned))
+
+
+class _Tee:
+    """Duplicate stdout/stderr writes into a file handle for persistent text logs."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+def _setup_run_dir(base_output_dir: str) -> str:
+    """Create a timestamped run subfolder under `base_output_dir`, tee
+    stdout/stderr to a `train.log` file inside it, and return the run dir
+    path. All checkpoints / best_review_gen_model should be saved under this
+    path so concurrent runs don't overwrite each other.
+    """
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(base_output_dir, f"run_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    log_path = os.path.join(run_dir, "train.log")
+    log_fh = open(log_path, "w", encoding="utf-8", buffering=1)  # line-buffered
+    sys.stdout = _Tee(sys.__stdout__, log_fh)
+    sys.stderr = _Tee(sys.__stderr__, log_fh)
+
+    print(f"[OK] Run dir : {run_dir}")
+    print(f"[OK] Log file: {log_path}")
+    return run_dir
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
+
+    # Resolve relative paths against the project root so checkpoints land
+    # INSIDE the project regardless of where the script is launched from.
+    args.output_dir = _resolve_under_project_root(args.output_dir)
+    args.data_path  = _resolve_under_project_root(args.data_path)
+
+    # Per-run timestamped subfolder + log file. After this, args.output_dir
+    # points to outputs/review_gen/run_<timestamp>/ so checkpoints from one
+    # run never overwrite another.
+    os.makedirs(args.output_dir, exist_ok=True)
+    base_output_dir  = args.output_dir
+    args.output_dir  = _setup_run_dir(base_output_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device     : {device}")
     print(f"Model base : {args.model_name}")
     print(f"Data path  : {args.data_path}")
-    print(f"Output dir : {args.output_dir}")
-    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"Base outdir: {base_output_dir}")
+    print(f"Run outdir : {args.output_dir}")
 
     # -----------------------------------------------------------------------
     # 1. Load data
@@ -510,7 +609,8 @@ def main():
         max_review_chars=args.max_review_chars,
         min_mean_confidence=args.min_mean_confidence,
         num_classes=num_classes,
-        keep_unparseable=args.keep_unparseable,
+        max_target_chars=args.max_target_chars,
+        min_summary_chars=args.min_summary_chars,
     )
     dev_ds = ReviewGenDataset(
         dev_data, tokenizer,
@@ -520,7 +620,8 @@ def main():
         max_review_chars=args.max_review_chars,
         min_mean_confidence=args.min_mean_confidence,
         num_classes=num_classes,
-        keep_unparseable=args.keep_unparseable,
+        max_target_chars=args.max_target_chars,
+        min_summary_chars=args.min_summary_chars,
     )
 
     if len(train_ds) == 0:
